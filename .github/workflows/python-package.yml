@@ -5,6 +5,8 @@ on:
     branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
+  release:
+    types: [published]          # 新增：发布 Release 时触发
 
 jobs:
   build:
@@ -13,6 +15,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+
+    # 新增：授予工作流向 Release 写入文件的权限
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
@@ -23,10 +29,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 缓存 pip 依赖（可选）
       - name: Cache pip dependencies
         uses: actions/cache@v3
-        id: cache-pip
         with:
           path: |
             ~/.cache/pip
@@ -44,7 +48,6 @@ jobs:
           fi
         shell: bash
 
-      # Ubuntu 需要系统 Tkinter 库
       - name: Install Tkinter (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -52,7 +55,6 @@ jobs:
           sudo apt install -y python3-tk
         shell: bash
 
-      # Windows 构建（使用 PowerShell）
       - name: Build with Nuitka (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -65,7 +67,6 @@ jobs:
                  main.py
         shell: pwsh
 
-      # Linux 构建（使用 Bash）
       - name: Build with Nuitka (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -76,7 +77,6 @@ jobs:
                  main.py
         shell: bash
 
-      # 调试：列出 dist 目录内容
       - name: List dist directory
         if: always()
         run: |
@@ -84,8 +84,8 @@ jobs:
           ls -la dist/ || echo "dist/ not found"
         shell: bash
 
-      # 上传构建产物
-      - name: Upload artifacts
+      # 上传到 Actions Artifacts（便于手动下载）
+      - name: Upload artifacts to Actions
         uses: actions/upload-artifact@v4
         with:
           name: PythonSizeCruncher-${{ runner.os }}
@@ -93,3 +93,14 @@ jobs:
             dist/main*
             dist/*.exe
           if-no-files-found: error
+
+      # 新增：如果是 Release 事件，上传到 Release 资产
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/main*
+            dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # 自动生成的 Token，无需手动设置
