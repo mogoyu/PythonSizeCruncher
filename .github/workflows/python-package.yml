@@ -185,12 +185,16 @@ jobs:
         run: ls -la artifacts/
 
       # 创建 Release 并上传所有可执行文件（通配符方式）
+      # 说明：
+      # - Windows 可执行文件：artifacts/*.exe
+      # - Linux 可执行文件（已包含在 .bin 中）：artifacts/*.bin
+
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files:
-            - artifacts/*.exe   # Windows 可执行文件
-            - artifacts/*.bin   # Linux 可执行文件
+            - artifacts/*.exe
+            - artifacts/*.bin
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
