@@ -1,12 +1,16 @@
-name: Build PythonSizeCruncher with Nuitka
+name: Build and Release with Nuitka
 
+# 触发条件：
+# - 推送代码到 main/master 分支时（用于日常测试）
+# - 创建针对 main/master 的 PR 时（用于测试）
+# - 推送以 v 开头的标签时（用于发布 Release）
 on:
   push:
     branches: [ "main", "master" ]
+    tags:
+      - "v*"                # 重要：推送 v1.0.0、v2.1 这样的标签时会触发
   pull_request:
     branches: [ "main", "master" ]
-  release:
-    types: [published]          # 新增：发布 Release 时触发
 
 jobs:
   build:
@@ -17,7 +21,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     permissions:
-      contents: write            # 必须：允许向 Release 写入文件
+      contents: write        # 允许上传文件到 Release
 
     steps:
       - name: Checkout code
@@ -83,7 +87,7 @@ jobs:
           ls -la dist/ || echo "dist/ not found"
         shell: bash
 
-      # 上传到 Actions Artifacts（保留）
+      # 将生成的文件上传到 Actions 的 Artifacts（临时存储）
       - name: Upload artifacts to Actions
         uses: actions/upload-artifact@v4
         with:
@@ -93,24 +97,32 @@ jobs:
             dist/*.exe
           if-no-files-found: error
 
-      # 调试 Release 事件信息
-      - name: Debug Release Event
-        if: github.event_name == 'release'
-        run: |
-          echo "Release event detected!"
-          echo "Release ID: ${{ github.event.release.id }}"
-          echo "Release tag: ${{ github.event.release.tag_name }}"
-          echo "Upload URL: ${{ github.event.release.upload_url }}"
-        shell: bash
+  # 新增：发布 Release 的任务
+  release:
+    needs: build            # 等待所有构建任务完成
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # 仅在推送标签时执行这个任务
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true   # 将所有平台的产物合并到一个目录
 
-      # 上传到 Release（关键步骤）
-      - name: Upload to Release
-        if: github.event_name == 'release'
+      - name: Verify downloaded files
+        run: ls -la artifacts/    # 调试：列出下载的文件
+
+      - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/main*
-            dist/*.exe
-          fail_on_unmatched_files: true   # 如果文件没找到，让步骤失败
+            artifacts/main.exe     # Windows 可执行文件
+            artifacts/main.bin     # Linux 可执行文件
+          tag_name: ${{ github.ref_name }}   # 自动使用推送的标签名
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
