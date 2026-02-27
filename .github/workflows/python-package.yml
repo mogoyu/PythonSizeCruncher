@@ -1,14 +1,14 @@
 name: Build and Release with Nuitka
 
 # 触发条件：
-# - 推送代码到 main/master 分支时（用于日常测试）
-# - 创建针对 main/master 的 PR 时（用于测试）
-# - 推送以 v 开头的标签时（用于发布 Release）
+# - 推送代码到 main/master 分支（日常测试）
+# - 创建针对 main/master 的 PR（测试）
+# - 推送以 v 开头的标签（例如 v1.0.0）时，自动构建并发布 Release
 on:
   push:
     branches: [ "main", "master" ]
     tags:
-      - "v*"                # 重要：推送 v1.0.0、v2.1 这样的标签时会触发
+      - "v*"
   pull_request:
     branches: [ "main", "master" ]
 
@@ -20,8 +20,9 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
 
+    # 必须的权限：允许上传 Artifact，后续 release 任务也需要写入 Release
     permissions:
-      contents: write        # 允许上传文件到 Release
+      contents: write
 
     steps:
       - name: Checkout code
@@ -32,6 +33,7 @@ jobs:
         with:
           python-version: '3.11'
 
+      # 缓存 pip 依赖（加速构建，但无 requirements.txt 时不影响）
       - name: Cache pip dependencies
         uses: actions/cache@v3
         with:
@@ -42,6 +44,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      # 安装 Nuitka 和 zstandard（支持 onefile 压缩）
+      # 如果有 requirements.txt，也一并安装
       - name: Install Nuitka and dependencies
         run: |
           pip install --upgrade pip
@@ -51,6 +55,7 @@ jobs:
           fi
         shell: bash
 
+      # Linux 需要系统 Tkinter 库
       - name: Install Tkinter (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -58,6 +63,7 @@ jobs:
           sudo apt install -y python3-tk
         shell: bash
 
+      # Windows 构建：使用 PowerShell，每行末尾反引号后不能有任何内容
       - name: Build with Nuitka (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -70,6 +76,7 @@ jobs:
                  main.py
         shell: pwsh
 
+      # Linux 构建：使用 Bash，每行末尾反斜杠后不能有任何内容
       - name: Build with Nuitka (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -80,6 +87,7 @@ jobs:
                  main.py
         shell: bash
 
+      # 调试：列出 dist 目录内容，确认生成的文件名
       - name: List dist directory
         if: always()
         run: |
@@ -87,7 +95,7 @@ jobs:
           ls -la dist/ || echo "dist/ not found"
         shell: bash
 
-      # 将生成的文件上传到 Actions 的 Artifacts（临时存储）
+      # 上传构建产物到 Actions Artifacts（临时存储，供 release 任务使用）
       - name: Upload artifacts to Actions
         uses: actions/upload-artifact@v4
         with:
@@ -97,31 +105,35 @@ jobs:
             dist/*.exe
           if-no-files-found: error
 
-  # 新增：发布 Release 的任务
+  # 发布 Release 的任务：仅在推送标签时执行
   release:
-    needs: build            # 等待所有构建任务完成
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # 仅在推送标签时执行这个任务
     if: startsWith(github.ref, 'refs/tags/')
+
     steps:
+      # 下载所有平台的 Artifacts 到当前工作目录下的 artifacts 文件夹
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true   # 将所有平台的产物合并到一个目录
+          merge-multiple: true
 
+      # 调试：列出下载的文件，确认文件名
       - name: Verify downloaded files
-        run: ls -la artifacts/    # 调试：列出下载的文件
+        run: ls -la artifacts/
 
+      # 创建 Release 并上传文件
+      # 使用 YAML 列表形式指定文件，每行末尾可加注释（YAML 语法允许）
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/main.exe     # Windows 可执行文件
-            artifacts/main.bin     # Linux 可执行文件
-          tag_name: ${{ github.ref_name }}   # 自动使用推送的标签名
+          files:
+            - artifacts/main.exe  # Windows 可执行文件
+            - artifacts/main.bin  # Linux 可执行文件
+          tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
         env:
