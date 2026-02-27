@@ -1,14 +1,11 @@
 name: Build and Release with Nuitka
 
-# 触发条件：
-# - 推送代码到 main/master 分支（日常测试）
-# - 创建针对 main/master 的 PR（测试）
-# - 推送以 v 开头的标签（例如 v1.0.0）时，自动构建并发布 Release
+# 触发条件
 on:
   push:
     branches: [ "main", "master" ]
     tags:
-      - "v*"
+      - "v*"                # 推送 v1.0.0 等标签时触发 Release
   pull_request:
     branches: [ "main", "master" ]
 
@@ -20,7 +17,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
 
-    # 必须的权限：允许上传 Artifact，后续 release 任务也需要写入 Release
+    # 必须的权限：允许上传 Artifact，release 任务需要写入 Release
     permissions:
       contents: write
 
@@ -33,7 +30,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 缓存 pip 依赖（加速构建，但无 requirements.txt 时不影响）
+      # 缓存 pip 依赖（加速构建）
       - name: Cache pip dependencies
         uses: actions/cache@v3
         with:
@@ -44,8 +41,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 安装 Nuitka 和 zstandard（支持 onefile 压缩）
-      # 如果有 requirements.txt，也一并安装
+      # 安装 Nuitka 和依赖
       - name: Install Nuitka and dependencies
         run: |
           pip install --upgrade pip
@@ -63,20 +59,77 @@ jobs:
           sudo apt install -y python3-tk
         shell: bash
 
-      # Windows 构建：使用 PowerShell，每行末尾反引号后不能有任何内容
+      # ------------------------------------------------------------------
+      # 步骤1：检测主脚本文件
+      # 逻辑：优先使用仓库变量 MAIN_SCRIPT，否则在常见文件名列表中查找
+      # 如果找不到，则终止工作流并报错
+      # ------------------------------------------------------------------
+      - name: Detect main script file
+        id: detect_main
+        run: |
+          # 如果设置了仓库变量 MAIN_SCRIPT，直接使用
+          if [ -n "${{ vars.MAIN_SCRIPT }}" ]; then
+            MAIN_SCRIPT="${{ vars.MAIN_SCRIPT }}"
+            echo "✅ 使用仓库变量 MAIN_SCRIPT: $MAIN_SCRIPT"
+          else
+            echo "ℹ️ 未设置 MAIN_SCRIPT 变量，尝试自动检测常见入口文件..."
+            # 常见入口文件名列表
+            candidates=("main.py" "app.py" "run.py" "start.py" "cli.py" "program.py")
+            found=""
+            for name in "${candidates[@]}"; do
+              if [ -f "$name" ]; then
+                found="$name"
+                echo "✅ 找到入口文件: $name"
+                break
+              fi
+            done
+            if [ -z "$found" ]; then
+              echo "❌ 错误：未找到任何常见入口文件，请设置仓库变量 MAIN_SCRIPT 指定主文件"
+              exit 1
+            fi
+            MAIN_SCRIPT="$found"
+          fi
+          echo "main_script=$MAIN_SCRIPT" >> $GITHUB_OUTPUT
+        shell: bash
+
+      # ------------------------------------------------------------------
+      # 步骤2：检测图标文件（仅 Windows 需要）
+      # 如果存在 file.ico，则设置 HAS_ICON=true，否则 false
+      # ------------------------------------------------------------------
+      - name: Check for icon file (Windows)
+        if: runner.os == 'Windows'
+        id: check_icon
+        run: |
+          if (Test-Path file.ico) {
+            echo "HAS_ICON=true" >> $env:GITHUB_OUTPUT
+            echo "✅ 图标文件 file.ico 存在，将添加图标参数"
+          } else {
+            echo "HAS_ICON=false" >> $env:GITHUB_OUTPUT
+            echo "ℹ️ 图标文件 file.ico 不存在，跳过图标参数"
+          }
+        shell: pwsh
+
+      # ------------------------------------------------------------------
+      # Windows 构建步骤
+      # 根据 HAS_ICON 决定是否添加图标参数
+      # 注意：PowerShell 命令中不能有内联注释，注释已放在上方
+      # ------------------------------------------------------------------
       - name: Build with Nuitka (Windows)
         if: runner.os == 'Windows'
         run: |
+          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true") { "--windows-icon-from-ico=file.ico" } else { "" }
           nuitka --standalone --onefile `
                  --assume-yes-for-downloads `
                  --enable-plugin=tk-inter `
                  --output-dir=dist `
-                 --windows-icon-from-ico=file.ico `
+                 $iconParam `
                  --include-data-file=white_files.json=white_files.json `
-                 main.py
+                 ${{ steps.detect_main.outputs.main_script }}
         shell: pwsh
 
-      # Linux 构建：使用 Bash，每行末尾反斜杠后不能有任何内容
+      # ------------------------------------------------------------------
+      # Linux 构建步骤（不需要图标参数）
+      # ------------------------------------------------------------------
       - name: Build with Nuitka (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -84,7 +137,7 @@ jobs:
                  --enable-plugin=tk-inter \
                  --output-dir=dist \
                  --include-data-file=white_files.json=white_files.json \
-                 main.py
+                 ${{ steps.detect_main.outputs.main_script }}
         shell: bash
 
       # 调试：列出 dist 目录内容，确认生成的文件名
@@ -95,17 +148,20 @@ jobs:
           ls -la dist/ || echo "dist/ not found"
         shell: bash
 
-      # 上传构建产物到 Actions Artifacts（临时存储，供 release 任务使用）
+      # 上传构建产物到 Actions Artifacts（临时存储）
       - name: Upload artifacts to Actions
         uses: actions/upload-artifact@v4
         with:
           name: PythonSizeCruncher-${{ runner.os }}
+          # 使用通配符捕获任何 .exe 和 .bin 文件，避免硬编码文件名
           path: |
-            dist/main*
             dist/*.exe
+            dist/*.bin
           if-no-files-found: error
 
-  # 发布 Release 的任务：仅在推送标签时执行
+  # ----------------------------------------------------------------------
+  # Release 任务：仅在推送标签时执行
+  # ----------------------------------------------------------------------
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -125,14 +181,13 @@ jobs:
       - name: Verify downloaded files
         run: ls -la artifacts/
 
-      # 创建 Release 并上传文件
-      # 使用 YAML 列表形式指定文件，每行末尾可加注释（YAML 语法允许）
+      # 创建 Release 并上传所有可执行文件（通配符方式）
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files:
-            - artifacts/main.exe  # Windows 可执行文件
-            - artifacts/main.bin  # Linux 可执行文件
+            - artifacts/*.exe   # Windows 可执行文件
+            - artifacts/*.bin   # Linux 可执行文件
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
