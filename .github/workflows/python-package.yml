@@ -23,9 +23,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 缓存 pip 依赖（可选，若希望缓存，建议使用 setup-python 内置缓存，无需单独 actions/cache）
-      # 注：下方使用 actions/cache 需要处理不同系统的路径，简单起见可直接移除本步骤。
-      # 若保留，请确保路径正确，或改用 setup-python 的 cache: 'pip'（需要 requirements.txt 存在）。
+      # 缓存 pip 依赖（可选，若无需缓存可删除此步骤）
       - name: Cache pip dependencies
         uses: actions/cache@v3
         id: cache-pip
@@ -40,7 +38,7 @@ jobs:
       - name: Install Nuitka and dependencies
         run: |
           pip install --upgrade pip
-          pip install nuitka
+          pip install nuitka zstandard  # 安装 zstandard 以支持 onefile 压缩
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
@@ -57,8 +55,10 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           nuitka --standalone --onefile `
+                 --assume-yes-for-downloads `           # 允许自动下载 Dependency Walker
+                 --enable-plugin=tk-inter `             # 启用 Tkinter 插件，包含 TCL 支持
                  --output-dir=dist `
-                 --windows-icon-from-ico=file.ico `
+                 --windows-icon-from-ico=file.ico `     # 若 file.ico 不存在，请删除此行
                  --include-data-file=white_files.json=white_files.json `
                  main.py
         shell: pwsh
@@ -67,12 +67,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           nuitka --standalone --onefile \
+                 --enable-plugin=tk-inter \
                  --output-dir=dist \
                  --include-data-file=white_files.json=white_files.json \
                  main.py
         shell: bash
 
-      # 可选：添加调试步骤，查看生成的文件
+      # 调试：列出 dist 目录内容
       - name: List dist directory
         if: always()
         run: |
@@ -87,5 +88,4 @@ jobs:
           path: |
             dist/main*
             dist/*.exe
-          # 注意：此处不能有注释，注释已移至上方
           if-no-files-found: error
