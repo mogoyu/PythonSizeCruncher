@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 缓存 pip 依赖（可选，若无需缓存可删除此步骤）
+      # 缓存 pip 依赖（可选）
       - name: Cache pip dependencies
         uses: actions/cache@v3
         id: cache-pip
@@ -38,12 +38,13 @@ jobs:
       - name: Install Nuitka and dependencies
         run: |
           pip install --upgrade pip
-          pip install nuitka zstandard  # 安装 zstandard 以支持 onefile 压缩
+          pip install nuitka zstandard
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
         shell: bash
 
+      # Ubuntu 需要系统 Tkinter 库
       - name: Install Tkinter (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -51,18 +52,20 @@ jobs:
           sudo apt install -y python3-tk
         shell: bash
 
+      # Windows 构建（使用 PowerShell）
       - name: Build with Nuitka (Windows)
         if: runner.os == 'Windows'
         run: |
           nuitka --standalone --onefile `
-                 --assume-yes-for-downloads `           # 允许自动下载 Dependency Walker
-                 --enable-plugin=tk-inter `             # 启用 Tkinter 插件，包含 TCL 支持
+                 --assume-yes-for-downloads `
+                 --enable-plugin=tk-inter `
                  --output-dir=dist `
-                 --windows-icon-from-ico=file.ico `     # 若 file.ico 不存在，请删除此行
+                 --windows-icon-from-ico=file.ico `
                  --include-data-file=white_files.json=white_files.json `
                  main.py
         shell: pwsh
 
+      # Linux 构建（使用 Bash）
       - name: Build with Nuitka (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -81,6 +84,7 @@ jobs:
           ls -la dist/ || echo "dist/ not found"
         shell: bash
 
+      # 上传构建产物
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
