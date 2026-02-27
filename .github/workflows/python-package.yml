@@ -29,7 +29,7 @@ jobs:
           python-version: '3.11'
           # 缓存 pip 依赖（本项目无第三方依赖，但保留无害）
           cache: 'pip'
-          cache-dependency-path: '**/requirements*.txt'
+          # cache-dependency-path: '**/requirements*.txt'
 
       # Ubuntu 需要额外安装 tkinter 系统库
       - name: Install Tkinter (Linux)
