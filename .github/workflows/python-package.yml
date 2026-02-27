@@ -1,11 +1,14 @@
 name: Build and Release with Nuitka
 
-# 触发条件
+# 触发条件：
+# - 推送代码到 main/master 分支（日常测试）
+# - 创建针对 main/master 的 PR（测试）
+# - 推送以 v 开头的标签（如 v1.0.0）时，自动构建并发布 Release
 on:
   push:
     branches: [ "main", "master" ]
     tags:
-      - "v*"                # 推送 v1.0.0 等标签时触发 Release
+      - "v*"
   pull_request:
     branches: [ "main", "master" ]
 
@@ -41,7 +44,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 安装 Nuitka 和依赖
+      # 安装 Nuitka 和 zstandard（支持 onefile 压缩）
+      # 如果有 requirements.txt，也一并安装
       - name: Install Nuitka and dependencies
         run: |
           pip install --upgrade pip
@@ -73,7 +77,6 @@ jobs:
             echo "✅ 使用仓库变量 MAIN_SCRIPT: $MAIN_SCRIPT"
           else
             echo "ℹ️ 未设置 MAIN_SCRIPT 变量，尝试自动检测常见入口文件..."
-            # 常见入口文件名列表
             candidates=("main.py" "app.py" "run.py" "start.py" "cli.py" "program.py")
             found=""
             for name in "${candidates[@]}"; do
