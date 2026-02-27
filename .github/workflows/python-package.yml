@@ -1,0 +1,73 @@
+name: Build PythonSizeCruncher with Nuitka
+
+on:
+  push:
+    branches: [ "main", "master" ]   # 触发分支，可自行修改
+  pull_request:
+    branches: [ "main", "master" ]
+  # release:                          # 可选：创建 Release 时自动打包
+  #   types: [published]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false                # 一个平台失败不影响其他平台
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # 如果需要指定 Python 版本，可在此扩展矩阵
+        # python-version: ['3.9', '3.10', '3.11']
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          # !!! 您可以根据需要修改 Python 版本
+          python-version: '3.11'
+          # 缓存 pip 依赖（本项目无第三方依赖，但保留无害）
+          cache: 'pip'
+          cache-dependency-path: '**/requirements*.txt'
+
+      # Ubuntu 需要额外安装 tkinter 系统库
+      - name: Install Tkinter (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y python3-tk
+        shell: bash
+
+      - name: Install Nuitka
+        run: |
+          python -m pip install --upgrade pip
+          pip install nuitka
+
+      - name: Build with Nuitka (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          nuitka --standalone --onefile `
+                 --output-dir=dist `
+                 --windows-icon-from-ico=file.ico `   # !!! 如果有图标文件，可保留；若不需要可删除此行
+                 --include-data-file=white_files.json=white_files.json `  # 包含白名单文件
+                 main.py
+        shell: pwsh
+
+      - name: Build with Nuitka (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          nuitka --standalone --onefile \
+                 --output-dir=dist \
+                 --include-data-file=white_files.json=white_files.json \
+                 main.py
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PythonSizeCruncher-${{ runner.os }}
+          path: |
+            dist/main*          # 匹配 Linux 下的 main 和 Windows 下的 main.exe
+            dist/*.exe
+          if-no-files-found: error
