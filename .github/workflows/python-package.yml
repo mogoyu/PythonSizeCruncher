@@ -62,8 +62,8 @@ jobs:
         run: |
           nuitka --standalone --onefile `
                  --output-dir=dist `
-                 --windows-icon-from-ico=file.ico `   # !!! 如果有图标文件，可保留；若不需要可删除此行
-                 --include-data-file=white_files.json=white_files.json `  # 包含白名单文件
+                 --windows-icon-from-ico=file.ico `
+                 --include-data-file=white_files.json=white_files.json `
                  main.py
         shell: pwsh
 
