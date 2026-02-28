@@ -1,10 +1,204 @@
-name: Build and Release with Nuitka (Dynamic Matrix)
+# =============================================================================
+# Nuitka 构建工作流 - 完全可配置版本（替换模式）
+# =============================================================================
+#
+# 【核心设计理念】
+# 三层配置优先级（高→低）：仓库变量 > 配置文件 > 代码默认值
+# 关键特性：完全替换而非合并，自定义配置时不会混入默认参数
+#
+# =============================================================================
+# 【配置方式一】仓库变量（最高优先级，适合临时调试）
+# =============================================================================
+#
+# 位置：GitHub Repo → Settings → Secrets and variables → Actions → Variables
+#
+# 1. 完整平台配置变量（完全覆盖所有参数）
+# 变量名格式：NUITKA_CONFIG_<PLATFORM>
+# 可用平台：WIN64, WIN32, LINUX, LINUX_OLD, MACOS
+#
+# 示例 - NUITKA_CONFIG_WIN64：
+# {
+#   "enabled": true,           # 是否启用此平台构建（true/false）
+#   "os": "windows-2022",      # GitHub Actions 运行器镜像
+#   "arch": "x64",             # 架构：x64, x86, arm64
+#   "shell": "pwsh",           # 脚本类型：bash 或 pwsh
+#   "ext": ".exe",             # 输出文件扩展名
+#   "nuitka_args": [           # Nuitka 编译参数数组（完整命令在此定义）
+#     "--standalone",
+#     "--onefile",
+#     "--windows-disable-console",
+#     "--enable-plugin=tk-inter",
+#     "--lto=yes",             # 链接时优化
+#     "--jobs=8"               # 并行编译线程数
+#   ],
+#   "data_files": [            # 需要打包的数据文件（自动检测存在性）
+#     "config.json",
+#     "assets/logo.png"
+#   ],
+#   "cache_path": "~\\AppData\\Local\\pip\\Cache",  # pip 缓存路径
+#   "system_deps": ""          # Linux 系统依赖包（空格分隔）
+# }
+#
+# 2. 平台开关变量（仅控制是否构建，使用默认配置）
+# 变量名格式：ENABLE_<PLATFORM>
+# 示例 - ENABLE_WIN32：false（禁用 32 位构建）
+# 示例 - ENABLE_MACOS：true（启用 macOS 构建）
+#
+# 【使用场景】
+# - 临时测试不同编译参数
+# - 快速切换构建平台开关
+# - 无需修改代码即可调整构建行为
+#
+# 【注意事项】
+# - 变量值必须是合法 JSON 字符串
+# - 设置后立即可生效，无需提交代码
+# - 会完全覆盖同平台的配置文件设置
+#
+# =============================================================================
+# 【配置方式二】nuitka-config.json 配置文件（次优先级，适合版本控制）
+# =============================================================================
+#
+# 位置：项目根目录 nuitka-config.json（需提交到 Git）
+#
+# 文件结构示例：
+# {
+#   "win64": {                 # 平台 ID，必须与代码中定义的一致
+#     "enabled": true,
+#     "os": "windows-2019",
+#     "arch": "x64",
+#     "shell": "pwsh",
+#     "ext": ".exe",
+#     "nuitka_args": [
+#       "--standalone",
+#       "--onefile",
+#       "--windows-disable-console",
+#       "--enable-plugin=tk-inter"
+#     ],
+#     "data_files": ["config.json"],
+#     "cache_path": "~\\AppData\\Local\\pip\\Cache",
+#     "system_deps": ""
+#   },
+#   "linux": {
+#     "enabled": true,
+#     "os": "ubuntu-20.04",
+#     "arch": "x64",
+#     "shell": "bash",
+#     "ext": ".bin",
+#     "nuitka_args": [
+#       "--standalone",
+#       "--onefile",
+#       "--enable-plugin=tk-inter",
+#       "--strip"               # 去除调试符号，减小体积
+#     ],
+#     "data_files": ["config.json"],
+#     "cache_path": "~/.cache/pip",
+#     "system_deps": "python3-tk patchelf"  # Linux 特有：系统包依赖
+#   },
+#   "macos": {
+#     "enabled": false,          # 默认禁用，需要时开启
+#     "os": "macos-latest",
+#     "arch": "x64",
+#     "shell": "bash",
+#     "ext": "",                 # macOS 单文件无扩展名
+#     "nuitka_args": [
+#       "--standalone",
+#       "--onefile",
+#       "--macos-disable-console",
+#       "--macos-create-app-bundle"  # 创建 .app 包
+#     ],
+#     "data_files": ["config.json"],
+#     "cache_path": "~/Library/Caches/pip",
+#     "system_deps": ""
+#   }
+# }
+#
+# 【使用场景】
+# - 将构建配置纳入版本控制
+# - 团队协作共享配置
+# - 为不同分支维护不同构建策略
+#
+# 【注意事项】
+# - 文件必须位于仓库根目录
+# - 必须是合法 JSON 格式
+# - 只定义部分平台时，未定义平台使用代码默认值
+# - 会被同平台的仓库变量完全覆盖（如果设置了变量）
+#
+# =============================================================================
+# 【配置方式三】代码默认值（保底方案，无需任何配置）
+# =============================================================================
+#
+# 当以下情况发生时使用代码中的硬编码默认配置：
+# - 未设置仓库变量 NUITKA_CONFIG_<PLATFORM>
+# - 未创建 nuitka-config.json 文件
+# - nuitka-config.json 中未定义该平台
+#
+# 默认配置行为：
+# - win64：启用，Windows 2019，控制台禁用，TK 插件
+# - win32：禁用（现代系统很少需要 32 位）
+# - linux：启用，Ubuntu 20.04，包含 patchelf
+# - linux-old：禁用（Ubuntu 18.04，用于旧系统兼容）
+# - macos：禁用（需要 Apple 开发者账号签名）
+#
+# 【修改方法】
+# 编辑本文件中的 get_default_config() 函数（不推荐，建议用前两种方式）
+#
+# =============================================================================
+# 【各平台特有参数说明】
+# =============================================================================
+#
+# Windows 特有：
+#   --windows-disable-console    # 禁用控制台窗口（GUI 应用）
+#   --windows-icon-from-ico=xxx # 图标文件（脚本会自动检测 file.ico）
+#   --windows-company-name=xxx   # 公司信息
+#   --windows-product-name=xxx   # 产品信息
+#
+# Linux 特有：
+#   --strip                      # 去除符号表，减小体积
+#   system_deps 字段            # 需要 apt 安装的系统包
+#     常见值："python3-tk patchelf"（TK 界面 + 动态库修复）
+#
+# macOS 特有：
+#   --macos-disable-console      # 禁用控制台
+#   --macos-create-app-bundle    # 创建 .app 目录结构
+#   --macos-sign-identity=xxx    # 代码签名（需要开发者证书）
+#
+# 通用优化参数：
+#   --lto=yes                    # 链接时优化，减小体积
+#   --jobs=4                     # 并行编译线程数
+#   --follow-import-to=numpy     # 强制包含特定模块
+#   --include-package=xxx        # 强制包含整个包
+#
+# =============================================================================
+# 【触发方式】
+# =============================================================================
+#
+# 1. 自动触发（推荐）：推送 v* 标签
+#    git tag v1.0.0
+#    git push origin v1.0.0
+#
+# 2. 手动触发：GitHub Actions 页面 → Run workflow
+#    可选择特定平台：all/windows/win64/win32/linux/linux-old/macos
+#
+# =============================================================================
+# 【调试技巧】
+# =============================================================================
+#
+# 1. 查看配置来源：在构建日志的 "Load build configurations" 步骤
+#    会显示每个平台使用的配置来源（repository variable / nuitka-config.json / code default）
+#
+# 2. 验证 JSON 格式：在线工具 https://jsonlint.com
+#
+# 3. 测试配置不生效：
+#    - 检查变量名是否拼写正确（区分大小写）
+#    - 确认 JSON 格式合法（无多余逗号、引号闭合）
+#    - 查看日志中的配置合并步骤输出
+#
+# 4. 临时禁用所有自定义配置：
+#    删除仓库变量和 nuitka-config.json，回退到代码默认值
+#
+# =============================================================================
 
-# =============================================================================
-# 动态平台控制版本 - 终极重构版 (修正版)
-# 原理：通过 JSON 配置集中管理所有平台，动态生成 Matrix 执行
-# 特点：单点配置、自动并行、零代码重复
-# =============================================================================
+name: Build and Release with Nuitka (Configurable)
 
 env:
   DEFAULT_PYTHON_VERSIONS: '["3.11"]'
@@ -104,186 +298,236 @@ jobs:
           fi
 
       # =========================================================================
-      # 平台配置中心 - 所有平台定义集中在此处
-      # 通过环境变量读取 vars 上下文，避免在表达式中使用动态变量名
+      # 配置加载 - 替换模式（不合并，完全覆盖）
       # =========================================================================
-      - name: Generate build matrix configuration
+      - name: Load build configurations (Replace Mode)
         id: build_config
         shell: bash
         env:
-          # 将 vars 上下文映射到环境变量，避免动态变量名问题
+          # 平台开关变量
           VAR_ENABLE_WIN64: ${{ vars.ENABLE_WIN64 }}
           VAR_ENABLE_WIN32: ${{ vars.ENABLE_WIN32 }}
           VAR_ENABLE_LINUX: ${{ vars.ENABLE_LINUX }}
           VAR_ENABLE_LINUX_OLD: ${{ vars.ENABLE_LINUX_OLD }}
           VAR_ENABLE_MACOS: ${{ vars.ENABLE_MACOS }}
+          # Nuitka 完整配置变量（完全覆盖模式）
+          VAR_NUITKA_WIN64: ${{ vars.NUITKA_CONFIG_WIN64 }}
+          VAR_NUITKA_WIN32: ${{ vars.NUITKA_CONFIG_WIN32 }}
+          VAR_NUITKA_LINUX: ${{ vars.NUITKA_CONFIG_LINUX }}
+          VAR_NUITKA_LINUX_OLD: ${{ vars.NUITKA_CONFIG_LINUX_OLD }}
+          VAR_NUITKA_MACOS: ${{ vars.NUITKA_CONFIG_MACOS }}
         run: |
-          # 读取各平台开关（优先使用仓库变量，否则使用默认值）
-          # 使用 ${VAR_NAME:-default} 语法：如果未设置或为空，使用默认值
-          ENABLE_WIN64="${VAR_ENABLE_WIN64:-true}"
-          ENABLE_WIN32="${VAR_ENABLE_WIN32:-false}"
-          ENABLE_LINUX="${VAR_ENABLE_LINUX:-true}"
-          ENABLE_LINUX_OLD="${VAR_ENABLE_LINUX_OLD:-false}"
-          ENABLE_MACOS="${VAR_ENABLE_MACOS:-false}"
+          # 安装 jq
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
 
-          echo "=== 平台开关状态 ==="
-          echo "WIN64: $ENABLE_WIN64"
-          echo "WIN32: $ENABLE_WIN32"
-          echo "LINUX: $ENABLE_LINUX"
-          echo "LINUX_OLD: $ENABLE_LINUX_OLD"
-          echo "MACOS: $ENABLE_MACOS"
-
-          # 构建平台配置数组
-          # 每个对象定义一个构建任务的所有参数
-          MATRIX_JSON='{"include":['
-          
-          add_build() {
-            local id=$1
-            local name=$2
-            local os=$3
-            local arch=$4
-            local shell=$5
-            local ext=$6
-            local nuitka_flags=$7
-            local cache_path=$8
-            local system_deps=$9
-            
-            if [ "${MATRIX_JSON}" != '{"include":[' ]; then
-              MATRIX_JSON="${MATRIX_JSON},"
-            fi
-            
-            # 转义 nuitka_flags 中的引号
-            local escaped_flags=$(echo "$nuitka_flags" | sed 's/"/\\"/g')
-            
-            MATRIX_JSON="${MATRIX_JSON}{\"id\":\"$id\",\"name\":\"$name\",\"os\":\"$os\",\"arch\":\"$arch\",\"shell\":\"$shell\",\"ext\":\"$ext\",\"nuitka_flags\":\"$escaped_flags\",\"cache_path\":\"$cache_path\",\"system_deps\":\"$system_deps\"}"
+          # 定义默认配置（保底方案）
+          get_default_config() {
+            local platform=$1
+            case $platform in
+              win64)
+                echo '{
+                  "enabled": true,
+                  "os": "windows-2019",
+                  "arch": "x64",
+                  "shell": "pwsh",
+                  "ext": ".exe",
+                  "nuitka_args": ["--standalone", "--onefile", "--assume-yes-for-downloads", "--enable-plugin=tk-inter", "--windows-disable-console"],
+                  "data_files": ["white_files.json", "config.json"],
+                  "cache_path": "~\\AppData\\Local\\pip\\Cache",
+                  "system_deps": ""
+                }'
+                ;;
+              win32)
+                echo '{
+                  "enabled": false,
+                  "os": "windows-2019",
+                  "arch": "x86",
+                  "shell": "pwsh",
+                  "ext": ".exe",
+                  "nuitka_args": ["--standalone", "--onefile", "--assume-yes-for-downloads", "--enable-plugin=tk-inter", "--windows-disable-console"],
+                  "data_files": ["white_files.json", "config.json"],
+                  "cache_path": "~\\AppData\\Local\\pip\\Cache",
+                  "system_deps": ""
+                }'
+                ;;
+              linux)
+                echo '{
+                  "enabled": true,
+                  "os": "ubuntu-20.04",
+                  "arch": "x64",
+                  "shell": "bash",
+                  "ext": ".bin",
+                  "nuitka_args": ["--standalone", "--onefile", "--assume-yes-for-downloads", "--enable-plugin=tk-inter"],
+                  "data_files": ["white_files.json", "config.json"],
+                  "cache_path": "~/.cache/pip",
+                  "system_deps": "python3-tk patchelf"
+                }'
+                ;;
+              linux-old)
+                echo '{
+                  "enabled": false,
+                  "os": "ubuntu-18.04",
+                  "arch": "x64",
+                  "shell": "bash",
+                  "ext": ".bin",
+                  "nuitka_args": ["--standalone", "--onefile", "--assume-yes-for-downloads", "--enable-plugin=tk-inter"],
+                  "data_files": ["white_files.json", "config.json"],
+                  "cache_path": "~/.cache/pip",
+                  "system_deps": "python3-tk patchelf"
+                }'
+                ;;
+              macos)
+                echo '{
+                  "enabled": false,
+                  "os": "macos-latest",
+                  "arch": "x64",
+                  "shell": "bash",
+                  "ext": "",
+                  "nuitka_args": ["--standalone", "--onefile", "--assume-yes-for-downloads", "--enable-plugin=tk-inter", "--macos-disable-console"],
+                  "data_files": ["white_files.json", "config.json"],
+                  "cache_path": "~/Library/Caches/pip",
+                  "system_deps": ""
+                }'
+                ;;
+            esac
           }
 
-          # Windows 64位配置
-          if [ "$ENABLE_WIN64" == "true" ]; then
-            add_build \
-              "win64" \
-              "Windows 64-bit" \
-              "windows-2019" \
-              "x64" \
-              "pwsh" \
-              ".exe" \
-              "--windows-disable-console --windows-icon-from-ico=file.ico" \
-              "~\\AppData\\Local\\pip\\Cache" \
-              ""
-          fi
-
-          # Windows 32位配置
-          if [ "$ENABLE_WIN32" == "true" ]; then
-            add_build \
-              "win32" \
-              "Windows 32-bit" \
-              "windows-2019" \
-              "x86" \
-              "pwsh" \
-              ".exe" \
-              "--windows-disable-console --windows-icon-from-ico=file.ico" \
-              "~\\AppData\\Local\\pip\\Cache" \
-              ""
-          fi
-
-          # Linux 配置
-          if [ "$ENABLE_LINUX" == "true" ]; then
-            add_build \
-              "linux" \
-              "Linux x86_64" \
-              "ubuntu-20.04" \
-              "x64" \
-              "bash" \
-              ".bin" \
-              "" \
-              "~/.cache/pip" \
-              "python3-tk patchelf"
-          fi
-
-          # Linux 旧版配置
-          if [ "$ENABLE_LINUX_OLD" == "true" ]; then
-            add_build \
-              "linux-old" \
-              "Linux x86_64 (Old)" \
-              "ubuntu-18.04" \
-              "x64" \
-              "bash" \
-              ".bin" \
-              "" \
-              "~/.cache/pip" \
-              "python3-tk patchelf"
-          fi
-
-          # macOS 配置
-          if [ "$ENABLE_MACOS" == "true" ]; then
-            add_build \
-              "macos" \
-              "macOS" \
-              "macos-latest" \
-              "x64" \
-              "bash" \
-              "" \
-              "--macos-disable-console" \
-              "~/Library/Caches/pip" \
-              ""
-          fi
-
-          MATRIX_JSON="${MATRIX_JSON}]}"
-
-          # 根据 workflow_dispatch 输入过滤矩阵
-          PLATFORM_FILTER="${{ github.event.inputs.platform }}"
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "$PLATFORM_FILTER" != "all" ]; then
-            echo "🎯 手动触发，过滤平台: $PLATFORM_FILTER"
-            # 使用 jq 过滤矩阵（如果已安装），否则输出全部
-            if command -v jq &> /dev/null; then
-              case $PLATFORM_FILTER in
-                windows)
-                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id | startswith("win"))]}')
-                  ;;
-                linux)
-                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id | startswith("linux") and .id != "linux-old")]}')
-                  ;;
-                linux-old)
-                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id == "linux-old")]}')
-                  ;;
-                macos)
-                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id == "macos")]}')
-                  ;;
-                *)
-                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq "{\"include\":[.include[] | select(.id == \"$PLATFORM_FILTER\")]}")
-                  ;;
-              esac
+          # 读取文件配置（如果存在）
+          get_file_config() {
+            local platform=$1
+            if [ -f "nuitka-config.json" ]; then
+              local cfg=$(jq -r ".[\"$platform\"] // empty" nuitka-config.json)
+              if [ -n "$cfg" ] && [ "$cfg" != "null" ]; then
+                echo "$cfg"
+                return 0
+              fi
             fi
-          fi
+            return 1
+          }
 
-          # 验证矩阵非空
-          BUILD_COUNT=$(echo "$MATRIX_JSON" | grep -o '"id"' | wc -l)
-          if [ "$BUILD_COUNT" -eq 0 ]; then
-            echo "⚠️ 警告：没有启用的构建平台"
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
-          fi
+          # 读取仓库变量配置（如果存在）
+          get_var_config() {
+            local platform=$1
+            local var_name="VAR_NUITKA_$(echo $platform | tr '[:lower:]-' '[:upper:]_')"
+            local var_value="${!var_name}"
+            
+            if [ -n "$var_value" ]; then
+              echo "$var_value"
+              return 0
+            fi
+            return 1
+          }
 
-          # 生成配置摘要
+          # 构建最终配置（替换模式：优先级 变量 > 文件 > 默认）
+          build_final_config() {
+            local platform=$1
+            local final_cfg=""
+            local source=""
+
+            # 优先级1：仓库变量（完全覆盖）
+            if cfg=$(get_var_config "$platform"); then
+              final_cfg="$cfg"
+              source="repository variable"
+            # 优先级2：配置文件
+            elif cfg=$(get_file_config "$platform"); then
+              final_cfg="$cfg"
+              source="nuitka-config.json"
+            # 优先级3：代码默认值
+            else
+              final_cfg=$(get_default_config "$platform")
+              source="code default"
+            fi
+
+            # 应用平台开关覆盖（如果设置了 vars.ENABLE_XXX）
+            local enable_var="VAR_ENABLE_$(echo $platform | tr '[:lower:]-' '[:upper:]_')"
+            local enable_value="${!enable_var}"
+            if [ -n "$enable_value" ]; then
+              final_cfg=$(echo "$final_cfg" | jq --arg v "$enable_value" '.enabled = ($v == "true")')
+            fi
+
+            echo "$final_cfg" | jq --arg s "$source" --arg p "$platform" '. + {"_source": $s, "_platform": $p}'
+          }
+
+          # 生成所有平台配置
+          PLATFORMS=("win64" "win32" "linux" "linux-old" "macos")
+          FINAL_CONFIGS=()
+
+          for platform in "${PLATFORMS[@]}"; do
+            cfg=$(build_final_config "$platform")
+            FINAL_CONFIGS+=("$cfg")
+            echo "📦 $platform: $(echo "$cfg" | jq -r '._source')"
+          done
+
+          # 生成 Matrix JSON（只包含 enabled=true 的平台）
+          MATRIX_JSON='{"include":[]}'
+          PLATFORM_FILTER="${{ github.event.inputs.platform }}"
+          IS_MANUAL=$([ "${{ github.event_name }}" == "workflow_dispatch" ] && echo "true" || echo "false")
+
+          for cfg in "${FINAL_CONFIGS[@]}"; do
+            platform=$(echo "$cfg" | jq -r '._platform')
+            enabled=$(echo "$cfg" | jq -r '.enabled')
+            
+            # 检查是否应该包含
+            SHOULD_INCLUDE=false
+            
+            if [ "$IS_MANUAL" == "true" ]; then
+              case "$PLATFORM_FILTER" in
+                all) [ "$enabled" == "true" ] && SHOULD_INCLUDE=true ;;
+                windows) [[ "$platform" == win* ]] && [ "$enabled" == "true" ] && SHOULD_INCLUDE=true ;;
+                linux) [[ "$platform" == "linux" ]] && [ "$enabled" == "true" ] && SHOULD_INCLUDE=true ;;
+                linux-old) [ "$platform" == "linux-old" ] && [ "$enabled" == "true" ] && SHOULD_INCLUDE=true ;;
+                macos) [ "$platform" == "macos" ] && [ "$enabled" == "true" ] && SHOULD_INCLUDE=true ;;
+                *) [ "$platform" == "$PLATFORM_FILTER" ] && [ "$enabled" == "true" ] && SHOULD_INCLUDE=true ;;
+              esac
+            else
+              [ "$enabled" == "true" ] && SHOULD_INCLUDE=true
+            fi
+
+            if [ "$SHOULD_INCLUDE" == "true" ]; then
+              # 清理内部字段，构建矩阵项
+              item=$(echo "$cfg" | jq '{
+                "id": ._platform,
+                "name": (._platform | gsub("win64"; "Windows 64-bit") | gsub("win32"; "Windows 32-bit") | gsub("linux-old"; "Linux Old") | gsub("linux"; "Linux") | gsub("macos"; "macOS")),
+                "os": .os,
+                "arch": .arch,
+                "shell": .shell,
+                "ext": .ext,
+                "nuitka_args": .nuitka_args,
+                "data_files": .data_files,
+                "cache_path": .cache_path,
+                "system_deps": .system_deps,
+                "_source": ._source
+              }')
+              MATRIX_JSON=$(echo "$MATRIX_JSON" | jq --argjson item "$item" '.include += [$item]')
+            fi
+          done
+
+          # 输出
+          BUILD_COUNT=$(echo "$MATRIX_JSON" | jq '.include | length')
+          COMPACT_MATRIX=$(echo "$MATRIX_JSON" | jq -c .)
+          echo "matrix=$COMPACT_MATRIX" >> "$GITHUB_OUTPUT"
+
+          # 摘要
           echo "summary<<EOF" >> "$GITHUB_OUTPUT"
           echo "主脚本: ${{ steps.detect.outputs.main_script }}" >> "$GITHUB_OUTPUT"
           echo "Python版本: ${{ steps.matrix.outputs.python_versions }}" >> "$GITHUB_OUTPUT"
           echo "版本号: ${{ steps.version.outputs.version }}" >> "$GITHUB_OUTPUT"
           echo "构建平台数: $BUILD_COUNT" >> "$GITHUB_OUTPUT"
-          echo "平台详情: $MATRIX_JSON" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "配置来源:" >> "$GITHUB_OUTPUT"
+          echo "$MATRIX_JSON" | jq -r '.include[] | "  \(.id): \(._source)"' >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-          echo "=== 生成的构建矩阵 ==="
-          echo "$MATRIX_JSON" | jq . || echo "$MATRIX_JSON"
+          echo "=== 最终构建矩阵 ==="
+          echo "$MATRIX_JSON" | jq .
 
   # =========================================================================
-  # 统一构建阶段 - 通过 Matrix 动态执行所有平台
-  # 无需为每个平台复制代码，所有差异通过 matrix 变量处理
+  # 统一构建阶段
   # =========================================================================
   build:
     needs: prepare
-    # 只有当矩阵非空时才执行
     if: ${{ fromJSON(needs.prepare.outputs.build_matrix).include[0] != null }}
     runs-on: ${{ matrix.build.os }}
     permissions:
@@ -291,7 +535,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix: 
-        # 动态注入矩阵配置
         build: ${{ fromJSON(needs.prepare.outputs.build_matrix).include }}
         python-version: ${{ fromJSON(needs.prepare.outputs.python_matrix) }}
     
@@ -348,26 +591,33 @@ jobs:
             "HAS_ICON=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
+      # =========================================================================
+      # 构建步骤 - 使用配置中的 Nuitka 参数
+      # =========================================================================
       - name: Build with Nuitka (Unix)
         if: ${{ matrix.build.shell == 'bash' }}
         shell: bash
         run: |
+          # 从配置读取 Nuitka 参数数组并展开
+          NUITKA_ARGS=$(echo '${{ toJson(matrix.build.nuitka_args) }}' | jq -r '.[]' | xargs)
+          
+          # 构建数据文件参数
           DATA_FILES=""
-          if [ -f white_files.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
-          fi
-          if [ -f config.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
-          fi
+          for file in $(echo '${{ toJson(matrix.build.data_files) }}' | jq -r '.[]'); do
+            if [ -f "$file" ]; then
+              DATA_FILES="$DATA_FILES --include-data-file=$file=$file"
+            fi
+          done
           
           OUTPUT_NAME="${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}"
           
-          nuitka --standalone --onefile \
-            --assume-yes-for-downloads \
-            --enable-plugin=tk-inter \
+          echo "🚀 执行 Nuitka 构建 [${{ matrix.build._source }}]"
+          echo "完整命令: nuitka $NUITKA_ARGS --output-dir=dist --output-filename=$OUTPUT_NAME${{ matrix.build.ext }} $DATA_FILES ${{ needs.prepare.outputs.main_script }}"
+          
+          # 执行构建
+          nuitka $NUITKA_ARGS \
             --output-dir=dist \
             --output-filename="$OUTPUT_NAME${{ matrix.build.ext }}" \
-            ${{ matrix.build.nuitka_flags }} \
             $DATA_FILES \
             ${{ needs.prepare.outputs.main_script }}
 
@@ -375,31 +625,34 @@ jobs:
         if: ${{ matrix.build.shell == 'pwsh' }}
         shell: pwsh
         run: |
-          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true" -and "${{ matrix.build.nuitka_flags }}" -match "icon-from-ico") { 
-            "--windows-icon-from-ico=file.ico" 
-          } else { "" }
+          # 从配置读取 Nuitka 参数数组
+          $nuitkaArgs = '${{ toJson(matrix.build.nuitka_args) }}' | ConvertFrom-Json
           
+          # 构建数据文件参数
           $dataFiles = @()
-          if (Test-Path white_files.json) { 
-            $dataFiles += "--include-data-file=white_files.json=white_files.json" 
-          }
-          if (Test-Path config.json) { 
-            $dataFiles += "--include-data-file=config.json=config.json" 
+          $files = '${{ toJson(matrix.build.data_files) }}' | ConvertFrom-Json
+          foreach ($file in $files) {
+            if (Test-Path $file) {
+              $dataFiles += "--include-data-file=$file=$file"
+            }
           }
           
-          $baseFlags = "${{ matrix.build.nuitka_flags }}" -replace "--windows-icon-from-ico=file.ico", ""
+          # Windows 特殊处理：动态添加图标（如果存在且配置中未指定）
+          $hasIconFlag = $nuitkaArgs | Where-Object { $_ -match "--windows-icon-from-ico" }
+          if (-not $hasIconFlag -and "${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true") {
+            $nuitkaArgs += "--windows-icon-from-ico=file.ico"
+          }
           
+          $argString = $nuitkaArgs -join " "
+          $dataString = $dataFiles -join " "
           $outputName = "${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}"
           
-          nuitka --standalone --onefile `
-            --assume-yes-for-downloads `
-            --enable-plugin=tk-inter `
-            --output-dir=dist `
-            --output-filename=$outputName${{ matrix.build.ext }} `
-            $baseFlags `
-            $iconParam `
-            $dataFiles `
-            ${{ needs.prepare.outputs.main_script }}
+          Write-Host "🚀 执行 Nuitka 构建 [${{ matrix.build._source }}]"
+          Write-Host "完整命令: nuitka $argString --output-dir=dist --output-filename=$outputName${{ matrix.build.ext }} $dataString ${{ needs.prepare.outputs.main_script }}"
+          
+          # 执行构建
+          $cmd = "nuitka $argString --output-dir=dist --output-filename=$outputName${{ matrix.build.ext }} $dataString ${{ needs.prepare.outputs.main_script }}"
+          Invoke-Expression $cmd
 
       - name: Collect build artifacts (Unix)
         if: ${{ matrix.build.shell == 'bash' }}
@@ -410,18 +663,7 @@ jobs:
           
           DIST_DIR="dist/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}.dist"
           if [ -d "$DIST_DIR" ]; then
-            if [ "${{ matrix.build.id }}" == "macos" ]; then
-              # macOS 可能是 .app 目录
-              tar -czf "release-artifacts/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
-            else
-              tar -czf "release-artifacts/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
-            fi
-          fi
-          
-          # macOS 特殊处理 .app  bundle
-          APP_DIR="dist/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}.app"
-          if [ -d "$APP_DIR" ]; then
-            tar -czf "release-artifacts/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-app.tar.gz" -C "$APP_DIR" .
+            tar -czf "release-artifacts/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
           fi
 
       - name: Collect build artifacts (Windows)
@@ -452,7 +694,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # 只有当需要发布且构建成功时才执行
     if: |
       always() && 
       needs.prepare.result == 'success' && 
@@ -467,23 +708,6 @@ jobs:
           pattern: '*-py*'
           merge-multiple: false
 
-      - name: Verify downloaded artifacts
-        shell: bash
-        run: |
-          echo "=== 构建产物结构 ==="
-          find all-artifacts -type f | head -30
-          
-          echo ""
-          echo "=== 各平台产物统计 ==="
-          for dir in all-artifacts/*/; do
-            if [ -d "$dir" ]; then
-              platform=$(basename "$dir")
-              size=$(du -sh "$dir" | cut -f1)
-              file_count=$(find "$dir" -type f | wc -l)
-              echo "  $platform: $size ($file_count 个文件)"
-            fi
-          done
-
       - name: Organize release assets
         shell: bash
         run: |
@@ -492,21 +716,15 @@ jobs:
           for artifact_dir in all-artifacts/*/; do
             if [ -d "$artifact_dir" ]; then
               platform=$(basename "$artifact_dir")
-              echo "处理平台: $platform"
-              
               for file in "$artifact_dir"/*; do
                 if [ -f "$file" ]; then
                   filename=$(basename "$file")
-                  # 保持文件名简洁，去掉重复的平台标识
                   cp "$file" "release-assets/${filename}"
-                  echo "  -> ${filename}"
                 fi
               done
             fi
           done
           
-          echo ""
-          echo "=== 最终发布文件 ==="
           ls -lh release-assets/
 
       - name: Create Release and Upload Assets
@@ -518,27 +736,10 @@ jobs:
             ## 构建配置
             ${{ needs.prepare.outputs.build_summary }}
             
-            ## 文件说明
-            - `*-win64-pyX.Y.exe`: Windows 64位单文件版本
-            - `*-win32-pyX.Y.exe`: Windows 32位单文件版本  
-            - `*-linux-pyX.Y.bin`: Linux x86_64单文件版本
-            - `*-linux-old-pyX.Y.bin`: Linux 旧版兼容单文件版本
-            - `*-macos-pyX.Y`: macOS单文件版本
-            - `*-full.zip`: Windows完整多文件版本
-            - `*-full.tar.gz`: Linux/macOS完整多文件版本
-            
             ## 使用说明
-            - **单文件版本**: 直接运行上述文件
-            - **完整版本**: 解压 `-full` 压缩包后运行
+            单文件版本直接运行，完整版本解压后运行。
           generate_release_notes: true
           files: release-assets/*
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Release Summary
-        if: success()
-        shell: bash
-        run: |
-          echo "✅ Release ${{ needs.prepare.outputs.version }} 创建成功"
-          echo "📦 上传文件数: $(ls release-assets/ | wc -l)"
