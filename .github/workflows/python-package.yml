@@ -188,13 +188,18 @@ jobs:
       # 说明：
       # - Windows 可执行文件：artifacts/*.exe
       # - Linux 可执行文件（已包含在 .bin 中）：artifacts/*.bin
+      # | Action                        | 参数      | 支持的语法                          |
+      # | ----------------------------- | ------- | ------------------------------ |
+      # | `actions/upload-artifact`     | `path`  | **支持两种** ✅ 数组 `[]` 或多行字符串 `\|` |
+      # | `softprops/action-gh-release` | `files` | **仅支持** 多行字符串 `\|` ❌ 不支持数组     |
+      # | `actions/checkout`            | 大多数参数   | 普通字符串                          |
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            - artifacts/*.exe
-            - artifacts/*.bin
+            artifacts/*.exe
+            artifacts/*.bin
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
