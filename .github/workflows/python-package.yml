@@ -1,35 +1,22 @@
 name: Build and Release with Nuitka
 
 # =============================================================================
-# 【配置区域】常用开关变量 - 使用仓库变量（推荐）或直接修改 if 条件
-# 
-# 方案1（推荐）：通过 GitHub 仓库设置 Variables，无需修改代码
-#   Settings -> Secrets and variables -> Variables -> New repository variable
-#   添加：ENABLE_WIN64 = true, ENABLE_WIN32 = false 等
-#
-# 方案2（快速）：直接修改下方各 jobs 的 if 条件中的 true/false
-#   每个 job 的 if 条件第一行就是控制开关
+# 动态平台控制版本
+# 原理：prepare job 读取配置，通过 outputs 传递给其他 job
+# 其他 job 通过 needs.prepare.outputs.enable_xxx == 'true' 判断是否执行
 # =============================================================================
 
 env:
-  # Python版本配置（JSON数组格式）
   DEFAULT_PYTHON_VERSIONS: '["3.11"]'
-  # 示例：多版本并行构建
-  # DEFAULT_PYTHON_VERSIONS: '["3.9", "3.10", "3.11", "3.12"]'
 
-# =============================================================================
-# 触发条件配置
-# =============================================================================
 on:
-  # 只有推送 v 开头的 tag 时才触发整个工作流
   push:
     tags:
       - "v*"
-  # 允许手动触发
   workflow_dispatch:
     inputs:
       platform:
-        description: '手动选择构建平台（覆盖默认配置）'
+        description: '手动选择构建平台'
         required: true
         default: 'all'
         type: choice
@@ -42,12 +29,9 @@ on:
           - linux-old
           - macos
 
-# =============================================================================
-# 作业定义
-# =============================================================================
 jobs:
   # =========================================================================
-  # 准备阶段
+  # 准备阶段 - 读取配置并设置平台开关
   # =========================================================================
   prepare:
     runs-on: ubuntu-latest
@@ -57,6 +41,12 @@ jobs:
       should_release: ${{ steps.version.outputs.should_release }}
       python_matrix: ${{ steps.matrix.outputs.python_versions }}
       build_config: ${{ steps.config.outputs.build_config }}
+      # 平台开关输出，供其他 job 使用
+      enable_win64: ${{ steps.platform_flags.outputs.enable_win64 }}
+      enable_win32: ${{ steps.platform_flags.outputs.enable_win32 }}
+      enable_linux: ${{ steps.platform_flags.outputs.enable_linux }}
+      enable_linux_old: ${{ steps.platform_flags.outputs.enable_linux_old }}
+      enable_macos: ${{ steps.platform_flags.outputs.enable_macos }}
     
     steps:
       - name: Checkout code
@@ -82,7 +72,6 @@ jobs:
             done
             if [ -z "$found" ]; then
               echo "❌ 错误：未找到任何常见入口文件"
-              echo "请设置仓库变量 MAIN_SCRIPT 指定主文件"
               exit 1
             fi
             MAIN_SCRIPT="$found"
@@ -119,6 +108,66 @@ jobs:
             echo "python_versions=${{ env.DEFAULT_PYTHON_VERSIONS }}" >> "$GITHUB_OUTPUT"
           fi
 
+      # =========================================================================
+      # 平台开关配置 - 集中控制所有平台的启用/禁用
+      # 修改逻辑：
+      #   1. 优先读取仓库变量 vars.ENABLE_XXX
+      #   2. 如果没有设置，使用默认值（win64/linux 默认启用，其他禁用）
+      #   3. 也可以在这里硬编码修改
+      # =========================================================================
+      - name: Set platform enable flags
+        id: platform_flags
+        shell: bash
+        run: |
+          # Windows 64位：默认启用
+          if [ -n "${{ vars.ENABLE_WIN64 }}" ]; then
+            ENABLE_WIN64="${{ vars.ENABLE_WIN64 }}"
+          else
+            ENABLE_WIN64="true"  # 修改这里：true/false
+          fi
+          
+          # Windows 32位：默认禁用
+          if [ -n "${{ vars.ENABLE_WIN32 }}" ]; then
+            ENABLE_WIN32="${{ vars.ENABLE_WIN32 }}"
+          else
+            ENABLE_WIN32="false"  # 修改这里：true/false
+          fi
+          
+          # Linux：默认启用
+          if [ -n "${{ vars.ENABLE_LINUX }}" ]; then
+            ENABLE_LINUX="${{ vars.ENABLE_LINUX }}"
+          else
+            ENABLE_LINUX="true"  # 修改这里：true/false
+          fi
+          
+          # Linux 旧版：默认禁用
+          if [ -n "${{ vars.ENABLE_LINUX_OLD }}" ]; then
+            ENABLE_LINUX_OLD="${{ vars.ENABLE_LINUX_OLD }}"
+          else
+            ENABLE_LINUX_OLD="false"  # 修改这里：true/false
+          fi
+          
+          # macOS：默认禁用
+          if [ -n "${{ vars.ENABLE_MACOS }}" ]; then
+            ENABLE_MACOS="${{ vars.ENABLE_MACOS }}"
+          else
+            ENABLE_MACOS="false"  # 修改这里：true/false
+          fi
+          
+          # 输出所有开关
+          echo "enable_win64=$ENABLE_WIN64" >> "$GITHUB_OUTPUT"
+          echo "enable_win32=$ENABLE_WIN32" >> "$GITHUB_OUTPUT"
+          echo "enable_linux=$ENABLE_LINUX" >> "$GITHUB_OUTPUT"
+          echo "enable_linux_old=$ENABLE_LINUX_OLD" >> "$GITHUB_OUTPUT"
+          echo "enable_macos=$ENABLE_MACOS" >> "$GITHUB_OUTPUT"
+          
+          echo "=== 平台开关配置 ==="
+          echo "WIN64: $ENABLE_WIN64"
+          echo "WIN32: $ENABLE_WIN32"
+          echo "LINUX: $ENABLE_LINUX"
+          echo "LINUX_OLD: $ENABLE_LINUX_OLD"
+          echo "MACOS: $ENABLE_MACOS"
+
       - name: Build configuration summary
         id: config
         shell: bash
@@ -127,18 +176,17 @@ jobs:
           echo "主脚本: ${{ steps.detect.outputs.main_script }}" >> "$GITHUB_OUTPUT"
           echo "Python版本: ${{ steps.matrix.outputs.python_versions }}" >> "$GITHUB_OUTPUT"
           echo "版本号: ${{ steps.version.outputs.version }}" >> "$GITHUB_OUTPUT"
+          echo "平台开关: WIN64=${{ steps.platform_flags.outputs.enable_win64 }}, WIN32=${{ steps.platform_flags.outputs.enable_win32 }}, LINUX=${{ steps.platform_flags.outputs.enable_linux }}, LINUX_OLD=${{ steps.platform_flags.outputs.enable_linux_old }}, MACOS=${{ steps.platform_flags.outputs.enable_macos }}" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
   # =========================================================================
   # Windows 64位构建
-  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
-  # 当前状态：启用（true）
+  # 通过 needs.prepare.outputs.enable_win64 动态控制
   # =========================================================================
   build-win64:
     needs: prepare
-    # 控制开关：将下行的 true 改为 false 即可禁用此平台
     if: |
-      (github.event_name != 'workflow_dispatch' && true) || 
+      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_win64 == 'true') || 
       (github.event_name == 'workflow_dispatch' && (
         inputs.platform == 'all' || 
         inputs.platform == 'windows' || 
@@ -234,14 +282,12 @@ jobs:
 
   # =========================================================================
   # Windows 32位构建
-  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
-  # 当前状态：禁用（false）
+  # 通过 needs.prepare.outputs.enable_win32 动态控制
   # =========================================================================
   build-win32:
     needs: prepare
-    # 控制开关：将下行的 false 改为 true 即可启用此平台
     if: |
-      (github.event_name != 'workflow_dispatch' && false) || 
+      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_win32 == 'true') || 
       (github.event_name == 'workflow_dispatch' && (
         inputs.platform == 'all' || 
         inputs.platform == 'windows' || 
@@ -337,14 +383,12 @@ jobs:
 
   # =========================================================================
   # Linux x86_64构建
-  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
-  # 当前状态：启用（true）
+  # 通过 needs.prepare.outputs.enable_linux 动态控制
   # =========================================================================
   build-linux:
     needs: prepare
-    # 控制开关：将下行的 true 改为 false 即可禁用此平台
     if: |
-      (github.event_name != 'workflow_dispatch' && true) || 
+      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_linux == 'true') || 
       (github.event_name == 'workflow_dispatch' && (
         inputs.platform == 'all' || 
         inputs.platform == 'linux'
@@ -429,14 +473,12 @@ jobs:
 
   # =========================================================================
   # Linux 旧版兼容构建
-  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
-  # 当前状态：禁用（false）
+  # 通过 needs.prepare.outputs.enable_linux_old 动态控制
   # =========================================================================
   build-linux-old:
     needs: prepare
-    # 控制开关：将下行的 false 改为 true 即可启用此平台
     if: |
-      (github.event_name != 'workflow_dispatch' && false) || 
+      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_linux_old == 'true') || 
       (github.event_name == 'workflow_dispatch' && inputs.platform == 'linux-old')
     runs-on: ubuntu-18.04
     permissions:
@@ -518,14 +560,12 @@ jobs:
 
   # =========================================================================
   # macOS构建
-  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
-  # 当前状态：禁用（false）
+  # 通过 needs.prepare.outputs.enable_macos 动态控制
   # =========================================================================
   build-macos:
     needs: prepare
-    # 控制开关：将下行的 false 改为 true 即可启用此平台
     if: |
-      (github.event_name != 'workflow_dispatch' && false) || 
+      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_macos == 'true') || 
       (github.event_name == 'workflow_dispatch' && (
         inputs.platform == 'all' || 
         inputs.platform == 'macos'
