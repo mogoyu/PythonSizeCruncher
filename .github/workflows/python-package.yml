@@ -1,83 +1,77 @@
 name: Build and Release with Nuitka
 
-# 触发条件：
-# - 推送代码到 main/master 分支（日常测试）
-# - 创建针对 main/master 的 PR（测试）
-# - 推送以 v 开头的标签（如 v1.0.0）时，自动构建并发布 Release
+# =============================================================================
+# 【配置区域】常用开关变量 - 使用仓库变量（推荐）或直接修改 if 条件
+# 
+# 方案1（推荐）：通过 GitHub 仓库设置 Variables，无需修改代码
+#   Settings -> Secrets and variables -> Variables -> New repository variable
+#   添加：ENABLE_WIN64 = true, ENABLE_WIN32 = false 等
+#
+# 方案2（快速）：直接修改下方各 jobs 的 if 条件中的 true/false
+#   每个 job 的 if 条件第一行就是控制开关
+# =============================================================================
+
+env:
+  # Python版本配置（JSON数组格式）
+  DEFAULT_PYTHON_VERSIONS: '["3.11"]'
+  # 示例：多版本并行构建
+  # DEFAULT_PYTHON_VERSIONS: '["3.9", "3.10", "3.11", "3.12"]'
+
+# =============================================================================
+# 触发条件配置
+# =============================================================================
 on:
+  # 只有推送 v 开头的 tag 时才触发整个工作流
   push:
-    branches: [ "main", "master" ]
     tags:
       - "v*"
-  pull_request:
-    branches: [ "main", "master" ]
+  # 允许手动触发
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: '手动选择构建平台（覆盖默认配置）'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - windows
+          - win64
+          - win32
+          - linux
+          - linux-old
+          - macos
 
+# =============================================================================
+# 作业定义
+# =============================================================================
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-
-    # 必须的权限：允许上传 Artifact，release 任务需要写入 Release
-    permissions:
-      contents: write
-
+  # =========================================================================
+  # 准备阶段
+  # =========================================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      main_script: ${{ steps.detect.outputs.main_script }}
+      version: ${{ steps.version.outputs.version }}
+      should_release: ${{ steps.version.outputs.should_release }}
+      python_matrix: ${{ steps.matrix.outputs.python_versions }}
+      build_config: ${{ steps.config.outputs.build_config }}
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      # 缓存 pip 依赖（加速构建）
-      - name: Cache pip dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cache/pip
-            ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # 安装 Nuitka 和 zstandard（支持 onefile 压缩）
-      # 如果有 requirements.txt，也一并安装
-      - name: Install Nuitka and dependencies
-        run: |
-          pip install --upgrade pip
-          pip install nuitka zstandard
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-        shell: bash
-
-      # Linux 需要系统 Tkinter 库
-      - name: Install Tkinter (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install -y python3-tk
-        shell: bash
-
-      # ------------------------------------------------------------------
-      # 步骤1：检测主脚本文件
-      # 逻辑：优先使用仓库变量 MAIN_SCRIPT，否则在常见文件名列表中查找
-      # 如果找不到，则终止工作流并报错
-      # ------------------------------------------------------------------
       - name: Detect main script file
-        id: detect_main
+        id: detect
+        shell: bash
         run: |
-          # 如果设置了仓库变量 MAIN_SCRIPT，直接使用
           if [ -n "${{ vars.MAIN_SCRIPT }}" ]; then
             MAIN_SCRIPT="${{ vars.MAIN_SCRIPT }}"
             echo "✅ 使用仓库变量 MAIN_SCRIPT: $MAIN_SCRIPT"
           else
-            echo "ℹ️ 未设置 MAIN_SCRIPT 变量，尝试自动检测常见入口文件..."
-            candidates=("main.py" "app.py" "run.py" "start.py" "cli.py" "program.py")
+            echo "ℹ️ 尝试自动检测常见入口文件..."
+            candidates=("main.py" "app.py" "run.py" "start.py" "cli.py" "program.py" "__main__.py")
             found=""
             for name in "${candidates[@]}"; do
               if [ -f "$name" ]; then
@@ -87,121 +81,625 @@ jobs:
               fi
             done
             if [ -z "$found" ]; then
-              echo "❌ 错误：未找到任何常见入口文件，请设置仓库变量 MAIN_SCRIPT 指定主文件"
+              echo "❌ 错误：未找到任何常见入口文件"
+              echo "请设置仓库变量 MAIN_SCRIPT 指定主文件"
               exit 1
             fi
             MAIN_SCRIPT="$found"
           fi
-          echo "main_script=$MAIN_SCRIPT" >> $GITHUB_OUTPUT
-        shell: bash
+          
+          if [ ! -f "$MAIN_SCRIPT" ]; then
+            echo "❌ 错误：指定的主文件不存在: $MAIN_SCRIPT"
+            exit 1
+          fi
+          
+          echo "main_script=$MAIN_SCRIPT" >> "$GITHUB_OUTPUT"
 
-      # ------------------------------------------------------------------
-      # 步骤2：检测图标文件（仅 Windows 需要）
-      # 如果存在 file.ico，则设置 HAS_ICON=true，否则 false
-      # ------------------------------------------------------------------
-      - name: Check for icon file (Windows)
-        if: runner.os == 'Windows'
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "version=dev-$SHORT_SHA" >> "$GITHUB_OUTPUT"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Python matrix
+        id: matrix
+        shell: bash
+        run: |
+          if [ -n "${{ vars.PYTHON_VERSIONS }}" ]; then
+            echo "python_versions=${{ vars.PYTHON_VERSIONS }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "python_versions=${{ env.DEFAULT_PYTHON_VERSIONS }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build configuration summary
+        id: config
+        shell: bash
+        run: |
+          echo "build_config<<EOF" >> "$GITHUB_OUTPUT"
+          echo "主脚本: ${{ steps.detect.outputs.main_script }}" >> "$GITHUB_OUTPUT"
+          echo "Python版本: ${{ steps.matrix.outputs.python_versions }}" >> "$GITHUB_OUTPUT"
+          echo "版本号: ${{ steps.version.outputs.version }}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+  # =========================================================================
+  # Windows 64位构建
+  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
+  # 当前状态：启用（true）
+  # =========================================================================
+  build-win64:
+    needs: prepare
+    # 控制开关：将下行的 true 改为 false 即可禁用此平台
+    if: |
+      (github.event_name != 'workflow_dispatch' && true) || 
+      (github.event_name == 'workflow_dispatch' && (
+        inputs.platform == 'all' || 
+        inputs.platform == 'windows' || 
+        inputs.platform == 'win64'
+      ))
+    runs-on: windows-2019
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }} (x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: 'x64'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: win64-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: win64-py${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          pip install --upgrade pip
+          pip install nuitka zstandard
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+      - name: Check for icon file
         id: check_icon
+        shell: pwsh
         run: |
           if (Test-Path file.ico) {
-            echo "HAS_ICON=true" >> $env:GITHUB_OUTPUT
-            echo "✅ 图标文件 file.ico 存在，将添加图标参数"
+            "HAS_ICON=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           } else {
-            echo "HAS_ICON=false" >> $env:GITHUB_OUTPUT
-            echo "ℹ️ 图标文件 file.ico 不存在，跳过图标参数"
+            "HAS_ICON=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
-        shell: pwsh
 
-      # ------------------------------------------------------------------
-      # Windows 构建步骤
-      # 根据 HAS_ICON 决定是否添加图标参数
-      # 注意：PowerShell 命令中不能有内联注释，注释已放在上方
-      # ------------------------------------------------------------------
-      - name: Build with Nuitka (Windows)
-        if: runner.os == 'Windows'
+      - name: Build with Nuitka
+        shell: pwsh
         run: |
-          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true") { "--windows-icon-from-ico=file.ico" } else { "" }
+          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true") { 
+            "--windows-icon-from-ico=file.ico" 
+          } else { "" }
+          
+          $dataFiles = @()
+          if (Test-Path white_files.json) { 
+            $dataFiles += "--include-data-file=white_files.json=white_files.json" 
+          }
+          if (Test-Path config.json) { 
+            $dataFiles += "--include-data-file=config.json=config.json" 
+          }
+          
+          $outputName = "${{ github.event.repository.name }}-win64-py${{ matrix.python-version }}"
+          
           nuitka --standalone --onefile `
-                 --assume-yes-for-downloads `
-                 --enable-plugin=tk-inter `
-                 --output-dir=dist `
-                 $iconParam `
-                 --include-data-file=white_files.json=white_files.json `
-                 ${{ steps.detect_main.outputs.main_script }}
+            --assume-yes-for-downloads `
+            --enable-plugin=tk-inter `
+            --windows-disable-console `
+            --output-dir=dist `
+            --output-filename=$outputName.exe `
+            $iconParam `
+            $dataFiles `
+            ${{ needs.prepare.outputs.main_script }}
+
+      - name: Collect build artifacts
         shell: pwsh
-
-      # ------------------------------------------------------------------
-      # Linux 构建步骤（不需要图标参数）
-      # ------------------------------------------------------------------
-      - name: Build with Nuitka (Linux)
-        if: runner.os == 'Linux'
         run: |
-          nuitka --standalone --onefile \
-                 --enable-plugin=tk-inter \
-                 --output-dir=dist \
-                 --include-data-file=white_files.json=white_files.json \
-                 ${{ steps.detect_main.outputs.main_script }}
-        shell: bash
+          New-Item -ItemType Directory -Force -Path "release-artifacts"
+          Copy-Item "dist\*.exe" "release-artifacts\" -ErrorAction SilentlyContinue
+          
+          $distDir = "dist\${{ github.event.repository.name }}-win64-py${{ matrix.python-version }}.dist"
+          if (Test-Path $distDir) {
+            $zipPath = "release-artifacts\${{ github.event.repository.name }}-win64-py${{ matrix.python-version }}-full.zip"
+            Compress-Archive -Path "$distDir\*" -DestinationPath $zipPath -Force
+          }
 
-      # 调试：列出 dist 目录内容，确认生成的文件名
-      - name: List dist directory
-        if: always()
-        run: |
-          echo "=== Dist directory contents ==="
-          ls -la dist/ || echo "dist/ not found"
-        shell: bash
-
-      # 上传构建产物到 Actions Artifacts（临时存储）
-      - name: Upload artifacts to Actions
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PythonSizeCruncher-${{ runner.os }}
-          # 使用通配符捕获任何 .exe 和 .bin 文件，避免硬编码文件名
-          path: |
-            dist/*.exe
-            dist/*.bin
+          name: win64-py${{ matrix.python-version }}
+          path: release-artifacts/*
           if-no-files-found: error
 
-  # ----------------------------------------------------------------------
-  # Release 任务：仅在推送标签时执行
-  # ----------------------------------------------------------------------
+  # =========================================================================
+  # Windows 32位构建
+  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
+  # 当前状态：禁用（false）
+  # =========================================================================
+  build-win32:
+    needs: prepare
+    # 控制开关：将下行的 false 改为 true 即可启用此平台
+    if: |
+      (github.event_name != 'workflow_dispatch' && false) || 
+      (github.event_name == 'workflow_dispatch' && (
+        inputs.platform == 'all' || 
+        inputs.platform == 'windows' || 
+        inputs.platform == 'win32'
+      ))
+    runs-on: windows-2019
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }} (x86)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: 'x86'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: win32-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: win32-py${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          pip install --upgrade pip
+          pip install nuitka zstandard
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+      - name: Check for icon file
+        id: check_icon
+        shell: pwsh
+        run: |
+          if (Test-Path file.ico) {
+            "HAS_ICON=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "HAS_ICON=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Build with Nuitka
+        shell: pwsh
+        run: |
+          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true") { 
+            "--windows-icon-from-ico=file.ico" 
+          } else { "" }
+          
+          $dataFiles = @()
+          if (Test-Path white_files.json) { 
+            $dataFiles += "--include-data-file=white_files.json=white_files.json" 
+          }
+          if (Test-Path config.json) { 
+            $dataFiles += "--include-data-file=config.json=config.json" 
+          }
+          
+          $outputName = "${{ github.event.repository.name }}-win32-py${{ matrix.python-version }}"
+          
+          nuitka --standalone --onefile `
+            --assume-yes-for-downloads `
+            --enable-plugin=tk-inter `
+            --windows-disable-console `
+            --output-dir=dist `
+            --output-filename=$outputName.exe `
+            $iconParam `
+            $dataFiles `
+            ${{ needs.prepare.outputs.main_script }}
+
+      - name: Collect build artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "release-artifacts"
+          Copy-Item "dist\*.exe" "release-artifacts\" -ErrorAction SilentlyContinue
+          
+          $distDir = "dist\${{ github.event.repository.name }}-win32-py${{ matrix.python-version }}.dist"
+          if (Test-Path $distDir) {
+            $zipPath = "release-artifacts\${{ github.event.repository.name }}-win32-py${{ matrix.python-version }}-full.zip"
+            Compress-Archive -Path "$distDir\*" -DestinationPath $zipPath -Force
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: win32-py${{ matrix.python-version }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  # =========================================================================
+  # Linux x86_64构建
+  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
+  # 当前状态：启用（true）
+  # =========================================================================
+  build-linux:
+    needs: prepare
+    # 控制开关：将下行的 true 改为 false 即可禁用此平台
+    if: |
+      (github.event_name != 'workflow_dispatch' && true) || 
+      (github.event_name == 'workflow_dispatch' && (
+        inputs.platform == 'all' || 
+        inputs.platform == 'linux'
+      ))
+    runs-on: ubuntu-20.04
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: linux-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: linux-py${{ matrix.python-version }}-
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk patchelf
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install nuitka zstandard
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Build with Nuitka
+        shell: bash
+        run: |
+          DATA_FILES=""
+          if [ -f white_files.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
+          fi
+          if [ -f config.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
+          fi
+          
+          OUTPUT_NAME="${{ github.event.repository.name }}-linux-py${{ matrix.python-version }}"
+          
+          nuitka --standalone --onefile \
+            --assume-yes-for-downloads \
+            --enable-plugin=tk-inter \
+            --output-dir=dist \
+            --output-filename="$OUTPUT_NAME.bin" \
+            $DATA_FILES \
+            ${{ needs.prepare.outputs.main_script }}
+
+      - name: Collect build artifacts
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          cp dist/*.bin release-artifacts/ 2>/dev/null || true
+          
+          DIST_DIR="dist/${{ github.event.repository.name }}-linux-py${{ matrix.python-version }}.dist"
+          if [ -d "$DIST_DIR" ]; then
+            tar -czf "release-artifacts/${{ github.event.repository.name }}-linux-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-py${{ matrix.python-version }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  # =========================================================================
+  # Linux 旧版兼容构建
+  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
+  # 当前状态：禁用（false）
+  # =========================================================================
+  build-linux-old:
+    needs: prepare
+    # 控制开关：将下行的 false 改为 true 即可启用此平台
+    if: |
+      (github.event_name != 'workflow_dispatch' && false) || 
+      (github.event_name == 'workflow_dispatch' && inputs.platform == 'linux-old')
+    runs-on: ubuntu-18.04
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: linux-old-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: linux-old-py${{ matrix.python-version }}-
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk patchelf
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install nuitka zstandard
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Build with Nuitka
+        shell: bash
+        run: |
+          DATA_FILES=""
+          if [ -f white_files.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
+          fi
+          if [ -f config.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
+          fi
+          
+          OUTPUT_NAME="${{ github.event.repository.name }}-linux-old-py${{ matrix.python-version }}"
+          
+          nuitka --standalone --onefile \
+            --assume-yes-for-downloads \
+            --enable-plugin=tk-inter \
+            --output-dir=dist \
+            --output-filename="$OUTPUT_NAME.bin" \
+            $DATA_FILES \
+            ${{ needs.prepare.outputs.main_script }}
+
+      - name: Collect build artifacts
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          cp dist/*.bin release-artifacts/ 2>/dev/null || true
+          
+          DIST_DIR="dist/${{ github.event.repository.name }}-linux-old-py${{ matrix.python-version }}.dist"
+          if [ -d "$DIST_DIR" ]; then
+            tar -czf "release-artifacts/${{ github.event.repository.name }}-linux-old-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-old-py${{ matrix.python-version }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  # =========================================================================
+  # macOS构建
+  # 开关控制：修改下方 if 条件中的 true（启用）或 false（禁用）
+  # 当前状态：禁用（false）
+  # =========================================================================
+  build-macos:
+    needs: prepare
+    # 控制开关：将下行的 false 改为 true 即可启用此平台
+    if: |
+      (github.event_name != 'workflow_dispatch' && false) || 
+      (github.event_name == 'workflow_dispatch' && (
+        inputs.platform == 'all' || 
+        inputs.platform == 'macos'
+      ))
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: macos-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: macos-py${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install nuitka zstandard
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Build with Nuitka
+        shell: bash
+        run: |
+          DATA_FILES=""
+          if [ -f white_files.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
+          fi
+          if [ -f config.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
+          fi
+          
+          OUTPUT_NAME="${{ github.event.repository.name }}-macos-py${{ matrix.python-version }}"
+          
+          nuitka --standalone --onefile \
+            --assume-yes-for-downloads \
+            --enable-plugin=tk-inter \
+            --macos-disable-console \
+            --output-dir=dist \
+            --output-filename="$OUTPUT_NAME" \
+            $DATA_FILES \
+            ${{ needs.prepare.outputs.main_script }}
+
+      - name: Collect build artifacts
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          cp dist/${{ github.event.repository.name }}-macos-py${{ matrix.python-version }} release-artifacts/ 2>/dev/null || true
+          
+          DIST_DIR="dist/${{ github.event.repository.name }}-macos-py${{ matrix.python-version }}.app"
+          if [ -d "$DIST_DIR" ]; then
+            tar -czf "release-artifacts/${{ github.event.repository.name }}-macos-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-py${{ matrix.python-version }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  # =========================================================================
+  # Release发布阶段
+  # =========================================================================
   release:
-    needs: build
+    needs: [prepare, build-win64, build-win32, build-linux, build-linux-old, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: startsWith(github.ref, 'refs/tags/')
-
+    if: |
+      always() && 
+      needs.prepare.result == 'success' && 
+      needs.prepare.outputs.should_release == 'true' &&
+      (needs.build-win64.result == 'success' || 
+       needs.build-win32.result == 'success' || 
+       needs.build-linux.result == 'success' ||
+       needs.build-linux-old.result == 'success' ||
+       needs.build-macos.result == 'success')
+    
     steps:
-      # 下载所有平台的 Artifacts 到当前工作目录下的 artifacts 文件夹
-      - name: Download all artifacts
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
+          path: all-artifacts
+          pattern: '*-py*'
+          merge-multiple: false
 
-      # 调试：列出下载的文件，确认文件名
-      - name: Verify downloaded files
-        run: ls -la artifacts/
+      - name: Verify downloaded artifacts
+        shell: bash
+        run: |
+          echo "=== 构建产物结构 ==="
+          find all-artifacts -type f | head -20
+          
+          echo ""
+          echo "=== 各平台产物统计 ==="
+          for dir in all-artifacts/*/; do
+            if [ -d "$dir" ]; then
+              platform=$(basename "$dir")
+              size=$(du -sh "$dir" | cut -f1)
+              file_count=$(find "$dir" -type f | wc -l)
+              echo "  $platform: $size ($file_count 个文件)"
+            fi
+          done
 
-      # 创建 Release 并上传所有可执行文件（通配符方式）
-      # 说明：
-      # - Windows 可执行文件：artifacts/*.exe
-      # - Linux 可执行文件（已包含在 .bin 中）：artifacts/*.bin
-      # | Action                        | 参数      | 支持的语法                          |
-      # | ----------------------------- | ------- | ------------------------------ |
-      # | `actions/upload-artifact`     | `path`  | **支持两种** ✅ 数组 `[]` 或多行字符串 `\|` |
-      # | `softprops/action-gh-release` | `files` | **仅支持** 多行字符串 `\|` ❌ 不支持数组     |
-      # | `actions/checkout`            | 大多数参数   | 普通字符串                          |
+      - name: Organize release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          
+          for artifact_dir in all-artifacts/*/; do
+            if [ -d "$artifact_dir" ]; then
+              platform=$(basename "$artifact_dir")
+              echo "处理平台: $platform"
+              
+              for file in "$artifact_dir"/*; do
+                if [ -f "$file" ]; then
+                  filename=$(basename "$file")
+                  cp "$file" "release-assets/${platform}-${filename}"
+                  echo "  -> ${platform}-${filename}"
+                fi
+              done
+            fi
+          done
+          
+          echo ""
+          echo "=== 最终发布文件 ==="
+          ls -lh release-assets/
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/*.exe
-            artifacts/*.bin
-          tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          body: |
+            ## 构建配置
+            ${{ needs.prepare.outputs.build_config }}
+            
+            ## 文件说明
+            - `*-win64-pyX.Y.exe`: Windows 64位单文件版本 (Python X.Y)
+            - `*-win32-pyX.Y.exe`: Windows 32位单文件版本 (Python X.Y)
+            - `*-linux-pyX.Y.bin`: Linux x86_64单文件版本 (Python X.Y)
+            - `*-linux-old-pyX.Y.bin`: Linux 旧版兼容单文件版本 (Python X.Y)
+            - `*-macos-pyX.Y`: macOS单文件版本 (Python X.Y)
+            - `*-full.zip`: Windows完整多文件版本（解压后运行）
+            - `*-full.tar.gz`: Linux/macOS完整多文件版本（解压后运行）
+            
+            ## 使用说明
+            - **单文件版本**: 直接运行上述 `.exe`、`.bin` 或无名扩展文件
+            - **完整版本**: 解压 `-full` 压缩包，运行其中的主程序
           generate_release_notes: true
+          files: release-assets/*
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release Summary
+        if: success()
+        shell: bash
+        run: |
+          echo "✅ Release ${{ needs.prepare.outputs.version }} 创建成功"
+          echo "📦 上传文件数: $(ls release-assets/ | wc -l)"
