@@ -1,9 +1,9 @@
-name: Build and Release with Nuitka
+name: Build and Release with Nuitka (Dynamic Matrix)
 
 # =============================================================================
-# 动态平台控制版本
-# 原理：prepare job 读取配置，通过 outputs 传递给其他 job
-# 其他 job 通过 needs.prepare.outputs.enable_xxx == 'true' 判断是否执行
+# 动态平台控制版本 - 终极重构版 (修正版)
+# 原理：通过 JSON 配置集中管理所有平台，动态生成 Matrix 执行
+# 特点：单点配置、自动并行、零代码重复
 # =============================================================================
 
 env:
@@ -31,7 +31,7 @@ on:
 
 jobs:
   # =========================================================================
-  # 准备阶段 - 读取配置并设置平台开关
+  # 准备阶段 - 读取配置并生成动态 Matrix
   # =========================================================================
   prepare:
     runs-on: ubuntu-latest
@@ -40,13 +40,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       should_release: ${{ steps.version.outputs.should_release }}
       python_matrix: ${{ steps.matrix.outputs.python_versions }}
-      build_config: ${{ steps.config.outputs.build_config }}
-      # 平台开关输出，供其他 job 使用
-      enable_win64: ${{ steps.platform_flags.outputs.enable_win64 }}
-      enable_win32: ${{ steps.platform_flags.outputs.enable_win32 }}
-      enable_linux: ${{ steps.platform_flags.outputs.enable_linux }}
-      enable_linux_old: ${{ steps.platform_flags.outputs.enable_linux_old }}
-      enable_macos: ${{ steps.platform_flags.outputs.enable_macos }}
+      build_matrix: ${{ steps.build_config.outputs.matrix }}
+      build_summary: ${{ steps.build_config.outputs.summary }}
     
     steps:
       - name: Checkout code
@@ -109,122 +104,241 @@ jobs:
           fi
 
       # =========================================================================
-      # 平台开关配置 - 集中控制所有平台的启用/禁用
-      # 修改逻辑：
-      #   1. 优先读取仓库变量 vars.ENABLE_XXX
-      #   2. 如果没有设置，使用默认值（win64/linux 默认启用，其他禁用）
-      #   3. 也可以在这里硬编码修改
+      # 平台配置中心 - 所有平台定义集中在此处
+      # 通过环境变量读取 vars 上下文，避免在表达式中使用动态变量名
       # =========================================================================
-      - name: Set platform enable flags
-        id: platform_flags
+      - name: Generate build matrix configuration
+        id: build_config
         shell: bash
+        env:
+          # 将 vars 上下文映射到环境变量，避免动态变量名问题
+          VAR_ENABLE_WIN64: ${{ vars.ENABLE_WIN64 }}
+          VAR_ENABLE_WIN32: ${{ vars.ENABLE_WIN32 }}
+          VAR_ENABLE_LINUX: ${{ vars.ENABLE_LINUX }}
+          VAR_ENABLE_LINUX_OLD: ${{ vars.ENABLE_LINUX_OLD }}
+          VAR_ENABLE_MACOS: ${{ vars.ENABLE_MACOS }}
         run: |
-          # Windows 64位：默认启用
-          if [ -n "${{ vars.ENABLE_WIN64 }}" ]; then
-            ENABLE_WIN64="${{ vars.ENABLE_WIN64 }}"
-          else
-            ENABLE_WIN64="true"  # 修改这里：true/false
-          fi
-          
-          # Windows 32位：默认禁用
-          if [ -n "${{ vars.ENABLE_WIN32 }}" ]; then
-            ENABLE_WIN32="${{ vars.ENABLE_WIN32 }}"
-          else
-            ENABLE_WIN32="false"  # 修改这里：true/false
-          fi
-          
-          # Linux：默认启用
-          if [ -n "${{ vars.ENABLE_LINUX }}" ]; then
-            ENABLE_LINUX="${{ vars.ENABLE_LINUX }}"
-          else
-            ENABLE_LINUX="true"  # 修改这里：true/false
-          fi
-          
-          # Linux 旧版：默认禁用
-          if [ -n "${{ vars.ENABLE_LINUX_OLD }}" ]; then
-            ENABLE_LINUX_OLD="${{ vars.ENABLE_LINUX_OLD }}"
-          else
-            ENABLE_LINUX_OLD="false"  # 修改这里：true/false
-          fi
-          
-          # macOS：默认禁用
-          if [ -n "${{ vars.ENABLE_MACOS }}" ]; then
-            ENABLE_MACOS="${{ vars.ENABLE_MACOS }}"
-          else
-            ENABLE_MACOS="false"  # 修改这里：true/false
-          fi
-          
-          # 输出所有开关
-          echo "enable_win64=$ENABLE_WIN64" >> "$GITHUB_OUTPUT"
-          echo "enable_win32=$ENABLE_WIN32" >> "$GITHUB_OUTPUT"
-          echo "enable_linux=$ENABLE_LINUX" >> "$GITHUB_OUTPUT"
-          echo "enable_linux_old=$ENABLE_LINUX_OLD" >> "$GITHUB_OUTPUT"
-          echo "enable_macos=$ENABLE_MACOS" >> "$GITHUB_OUTPUT"
-          
-          echo "=== 平台开关配置 ==="
+          # 读取各平台开关（优先使用仓库变量，否则使用默认值）
+          # 使用 ${VAR_NAME:-default} 语法：如果未设置或为空，使用默认值
+          ENABLE_WIN64="${VAR_ENABLE_WIN64:-true}"
+          ENABLE_WIN32="${VAR_ENABLE_WIN32:-false}"
+          ENABLE_LINUX="${VAR_ENABLE_LINUX:-true}"
+          ENABLE_LINUX_OLD="${VAR_ENABLE_LINUX_OLD:-false}"
+          ENABLE_MACOS="${VAR_ENABLE_MACOS:-false}"
+
+          echo "=== 平台开关状态 ==="
           echo "WIN64: $ENABLE_WIN64"
           echo "WIN32: $ENABLE_WIN32"
           echo "LINUX: $ENABLE_LINUX"
           echo "LINUX_OLD: $ENABLE_LINUX_OLD"
           echo "MACOS: $ENABLE_MACOS"
 
-      - name: Build configuration summary
-        id: config
-        shell: bash
-        run: |
-          echo "build_config<<EOF" >> "$GITHUB_OUTPUT"
+          # 构建平台配置数组
+          # 每个对象定义一个构建任务的所有参数
+          MATRIX_JSON='{"include":['
+          
+          add_build() {
+            local id=$1
+            local name=$2
+            local os=$3
+            local arch=$4
+            local shell=$5
+            local ext=$6
+            local nuitka_flags=$7
+            local cache_path=$8
+            local system_deps=$9
+            
+            if [ "${MATRIX_JSON}" != '{"include":[' ]; then
+              MATRIX_JSON="${MATRIX_JSON},"
+            fi
+            
+            # 转义 nuitka_flags 中的引号
+            local escaped_flags=$(echo "$nuitka_flags" | sed 's/"/\\"/g')
+            
+            MATRIX_JSON="${MATRIX_JSON}{\"id\":\"$id\",\"name\":\"$name\",\"os\":\"$os\",\"arch\":\"$arch\",\"shell\":\"$shell\",\"ext\":\"$ext\",\"nuitka_flags\":\"$escaped_flags\",\"cache_path\":\"$cache_path\",\"system_deps\":\"$system_deps\"}"
+          }
+
+          # Windows 64位配置
+          if [ "$ENABLE_WIN64" == "true" ]; then
+            add_build \
+              "win64" \
+              "Windows 64-bit" \
+              "windows-2019" \
+              "x64" \
+              "pwsh" \
+              ".exe" \
+              "--windows-disable-console --windows-icon-from-ico=file.ico" \
+              "~\\AppData\\Local\\pip\\Cache" \
+              ""
+          fi
+
+          # Windows 32位配置
+          if [ "$ENABLE_WIN32" == "true" ]; then
+            add_build \
+              "win32" \
+              "Windows 32-bit" \
+              "windows-2019" \
+              "x86" \
+              "pwsh" \
+              ".exe" \
+              "--windows-disable-console --windows-icon-from-ico=file.ico" \
+              "~\\AppData\\Local\\pip\\Cache" \
+              ""
+          fi
+
+          # Linux 配置
+          if [ "$ENABLE_LINUX" == "true" ]; then
+            add_build \
+              "linux" \
+              "Linux x86_64" \
+              "ubuntu-20.04" \
+              "x64" \
+              "bash" \
+              ".bin" \
+              "" \
+              "~/.cache/pip" \
+              "python3-tk patchelf"
+          fi
+
+          # Linux 旧版配置
+          if [ "$ENABLE_LINUX_OLD" == "true" ]; then
+            add_build \
+              "linux-old" \
+              "Linux x86_64 (Old)" \
+              "ubuntu-18.04" \
+              "x64" \
+              "bash" \
+              ".bin" \
+              "" \
+              "~/.cache/pip" \
+              "python3-tk patchelf"
+          fi
+
+          # macOS 配置
+          if [ "$ENABLE_MACOS" == "true" ]; then
+            add_build \
+              "macos" \
+              "macOS" \
+              "macos-latest" \
+              "x64" \
+              "bash" \
+              "" \
+              "--macos-disable-console" \
+              "~/Library/Caches/pip" \
+              ""
+          fi
+
+          MATRIX_JSON="${MATRIX_JSON}]}"
+
+          # 根据 workflow_dispatch 输入过滤矩阵
+          PLATFORM_FILTER="${{ github.event.inputs.platform }}"
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "$PLATFORM_FILTER" != "all" ]; then
+            echo "🎯 手动触发，过滤平台: $PLATFORM_FILTER"
+            # 使用 jq 过滤矩阵（如果已安装），否则输出全部
+            if command -v jq &> /dev/null; then
+              case $PLATFORM_FILTER in
+                windows)
+                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id | startswith("win"))]}')
+                  ;;
+                linux)
+                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id | startswith("linux") and .id != "linux-old")]}')
+                  ;;
+                linux-old)
+                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id == "linux-old")]}')
+                  ;;
+                macos)
+                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq '{"include":[.include[] | select(.id == "macos")]}')
+                  ;;
+                *)
+                  MATRIX_JSON=$(echo "$MATRIX_JSON" | jq "{\"include\":[.include[] | select(.id == \"$PLATFORM_FILTER\")]}")
+                  ;;
+              esac
+            fi
+          fi
+
+          # 验证矩阵非空
+          BUILD_COUNT=$(echo "$MATRIX_JSON" | grep -o '"id"' | wc -l)
+          if [ "$BUILD_COUNT" -eq 0 ]; then
+            echo "⚠️ 警告：没有启用的构建平台"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+          # 生成配置摘要
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
           echo "主脚本: ${{ steps.detect.outputs.main_script }}" >> "$GITHUB_OUTPUT"
           echo "Python版本: ${{ steps.matrix.outputs.python_versions }}" >> "$GITHUB_OUTPUT"
           echo "版本号: ${{ steps.version.outputs.version }}" >> "$GITHUB_OUTPUT"
-          echo "平台开关: WIN64=${{ steps.platform_flags.outputs.enable_win64 }}, WIN32=${{ steps.platform_flags.outputs.enable_win32 }}, LINUX=${{ steps.platform_flags.outputs.enable_linux }}, LINUX_OLD=${{ steps.platform_flags.outputs.enable_linux_old }}, MACOS=${{ steps.platform_flags.outputs.enable_macos }}" >> "$GITHUB_OUTPUT"
+          echo "构建平台数: $BUILD_COUNT" >> "$GITHUB_OUTPUT"
+          echo "平台详情: $MATRIX_JSON" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+          echo "=== 生成的构建矩阵 ==="
+          echo "$MATRIX_JSON" | jq . || echo "$MATRIX_JSON"
+
   # =========================================================================
-  # Windows 64位构建
-  # 通过 needs.prepare.outputs.enable_win64 动态控制
+  # 统一构建阶段 - 通过 Matrix 动态执行所有平台
+  # 无需为每个平台复制代码，所有差异通过 matrix 变量处理
   # =========================================================================
-  build-win64:
+  build:
     needs: prepare
-    if: |
-      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_win64 == 'true') || 
-      (github.event_name == 'workflow_dispatch' && (
-        inputs.platform == 'all' || 
-        inputs.platform == 'windows' || 
-        inputs.platform == 'win64'
-      ))
-    runs-on: windows-2019
+    # 只有当矩阵非空时才执行
+    if: ${{ fromJSON(needs.prepare.outputs.build_matrix).include[0] != null }}
+    runs-on: ${{ matrix.build.os }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
-      matrix:
-        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
+      matrix: 
+        # 动态注入矩阵配置
+        build: ${{ fromJSON(needs.prepare.outputs.build_matrix).include }}
+        python-version: ${{ fromJSON(needs.prepare.outputs.python_matrix) }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python ${{ matrix.python-version }} (x64)
+      - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: 'x64'
+          architecture: ${{ matrix.build.arch }}
 
       - name: Cache pip dependencies
         uses: actions/cache@v4
         with:
-          path: ~\AppData\Local\pip\Cache
-          key: win64-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: win64-py${{ matrix.python-version }}-
+          path: ${{ matrix.build.cache_path }}
+          key: ${{ matrix.build.id }}-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ matrix.build.id }}-py${{ matrix.python-version }}-
 
-      - name: Install dependencies
+      - name: Install system dependencies (Linux only)
+        if: ${{ startsWith(matrix.build.id, 'linux') }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.build.system_deps }}
+
+      - name: Install Python dependencies (Unix)
+        if: ${{ matrix.build.shell == 'bash' }}
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install nuitka zstandard
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Install Python dependencies (Windows)
+        if: ${{ matrix.build.shell == 'pwsh' }}
         shell: pwsh
         run: |
           pip install --upgrade pip
           pip install nuitka zstandard
           if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-      - name: Check for icon file
+      - name: Check for icon file (Windows only)
+        if: ${{ startsWith(matrix.build.id, 'win') }}
         id: check_icon
         shell: pwsh
         run: |
@@ -234,10 +348,34 @@ jobs:
             "HAS_ICON=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
-      - name: Build with Nuitka
+      - name: Build with Nuitka (Unix)
+        if: ${{ matrix.build.shell == 'bash' }}
+        shell: bash
+        run: |
+          DATA_FILES=""
+          if [ -f white_files.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
+          fi
+          if [ -f config.json ]; then
+            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
+          fi
+          
+          OUTPUT_NAME="${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}"
+          
+          nuitka --standalone --onefile \
+            --assume-yes-for-downloads \
+            --enable-plugin=tk-inter \
+            --output-dir=dist \
+            --output-filename="$OUTPUT_NAME${{ matrix.build.ext }}" \
+            ${{ matrix.build.nuitka_flags }} \
+            $DATA_FILES \
+            ${{ needs.prepare.outputs.main_script }}
+
+      - name: Build with Nuitka (Windows)
+        if: ${{ matrix.build.shell == 'pwsh' }}
         shell: pwsh
         run: |
-          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true") { 
+          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true" -and "${{ matrix.build.nuitka_flags }}" -match "icon-from-ico") { 
             "--windows-icon-from-ico=file.ico" 
           } else { "" }
           
@@ -249,397 +387,60 @@ jobs:
             $dataFiles += "--include-data-file=config.json=config.json" 
           }
           
-          $outputName = "${{ github.event.repository.name }}-win64-py${{ matrix.python-version }}"
+          $baseFlags = "${{ matrix.build.nuitka_flags }}" -replace "--windows-icon-from-ico=file.ico", ""
+          
+          $outputName = "${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}"
           
           nuitka --standalone --onefile `
             --assume-yes-for-downloads `
             --enable-plugin=tk-inter `
-            --windows-disable-console `
             --output-dir=dist `
-            --output-filename=$outputName.exe `
+            --output-filename=$outputName${{ matrix.build.ext }} `
+            $baseFlags `
             $iconParam `
             $dataFiles `
             ${{ needs.prepare.outputs.main_script }}
 
-      - name: Collect build artifacts
+      - name: Collect build artifacts (Unix)
+        if: ${{ matrix.build.shell == 'bash' }}
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          cp dist/*${{ matrix.build.ext }} release-artifacts/ 2>/dev/null || true
+          
+          DIST_DIR="dist/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}.dist"
+          if [ -d "$DIST_DIR" ]; then
+            if [ "${{ matrix.build.id }}" == "macos" ]; then
+              # macOS 可能是 .app 目录
+              tar -czf "release-artifacts/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
+            else
+              tar -czf "release-artifacts/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
+            fi
+          fi
+          
+          # macOS 特殊处理 .app  bundle
+          APP_DIR="dist/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}.app"
+          if [ -d "$APP_DIR" ]; then
+            tar -czf "release-artifacts/${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-app.tar.gz" -C "$APP_DIR" .
+          fi
+
+      - name: Collect build artifacts (Windows)
+        if: ${{ matrix.build.shell == 'pwsh' }}
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "release-artifacts"
-          Copy-Item "dist\*.exe" "release-artifacts\" -ErrorAction SilentlyContinue
+          Copy-Item "dist\*${{ matrix.build.ext }}" "release-artifacts\" -ErrorAction SilentlyContinue
           
-          $distDir = "dist\${{ github.event.repository.name }}-win64-py${{ matrix.python-version }}.dist"
+          $distDir = "dist\${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}.dist"
           if (Test-Path $distDir) {
-            $zipPath = "release-artifacts\${{ github.event.repository.name }}-win64-py${{ matrix.python-version }}-full.zip"
+            $zipPath = "release-artifacts\${{ github.event.repository.name }}-${{ matrix.build.id }}-py${{ matrix.python-version }}-full.zip"
             Compress-Archive -Path "$distDir\*" -DestinationPath $zipPath -Force
           }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: win64-py${{ matrix.python-version }}
-          path: release-artifacts/*
-          if-no-files-found: error
-
-  # =========================================================================
-  # Windows 32位构建
-  # 通过 needs.prepare.outputs.enable_win32 动态控制
-  # =========================================================================
-  build-win32:
-    needs: prepare
-    if: |
-      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_win32 == 'true') || 
-      (github.event_name == 'workflow_dispatch' && (
-        inputs.platform == 'all' || 
-        inputs.platform == 'windows' || 
-        inputs.platform == 'win32'
-      ))
-    runs-on: windows-2019
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python ${{ matrix.python-version }} (x86)
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          architecture: 'x86'
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: win32-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: win32-py${{ matrix.python-version }}-
-
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          pip install --upgrade pip
-          pip install nuitka zstandard
-          if (Test-Path requirements.txt) { pip install -r requirements.txt }
-
-      - name: Check for icon file
-        id: check_icon
-        shell: pwsh
-        run: |
-          if (Test-Path file.ico) {
-            "HAS_ICON=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            "HAS_ICON=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          }
-
-      - name: Build with Nuitka
-        shell: pwsh
-        run: |
-          $iconParam = if ("${{ steps.check_icon.outputs.HAS_ICON }}" -eq "true") { 
-            "--windows-icon-from-ico=file.ico" 
-          } else { "" }
-          
-          $dataFiles = @()
-          if (Test-Path white_files.json) { 
-            $dataFiles += "--include-data-file=white_files.json=white_files.json" 
-          }
-          if (Test-Path config.json) { 
-            $dataFiles += "--include-data-file=config.json=config.json" 
-          }
-          
-          $outputName = "${{ github.event.repository.name }}-win32-py${{ matrix.python-version }}"
-          
-          nuitka --standalone --onefile `
-            --assume-yes-for-downloads `
-            --enable-plugin=tk-inter `
-            --windows-disable-console `
-            --output-dir=dist `
-            --output-filename=$outputName.exe `
-            $iconParam `
-            $dataFiles `
-            ${{ needs.prepare.outputs.main_script }}
-
-      - name: Collect build artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "release-artifacts"
-          Copy-Item "dist\*.exe" "release-artifacts\" -ErrorAction SilentlyContinue
-          
-          $distDir = "dist\${{ github.event.repository.name }}-win32-py${{ matrix.python-version }}.dist"
-          if (Test-Path $distDir) {
-            $zipPath = "release-artifacts\${{ github.event.repository.name }}-win32-py${{ matrix.python-version }}-full.zip"
-            Compress-Archive -Path "$distDir\*" -DestinationPath $zipPath -Force
-          }
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: win32-py${{ matrix.python-version }}
-          path: release-artifacts/*
-          if-no-files-found: error
-
-  # =========================================================================
-  # Linux x86_64构建
-  # 通过 needs.prepare.outputs.enable_linux 动态控制
-  # =========================================================================
-  build-linux:
-    needs: prepare
-    if: |
-      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_linux == 'true') || 
-      (github.event_name == 'workflow_dispatch' && (
-        inputs.platform == 'all' || 
-        inputs.platform == 'linux'
-      ))
-    runs-on: ubuntu-20.04
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: linux-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: linux-py${{ matrix.python-version }}-
-
-      - name: Install system dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk patchelf
-
-      - name: Install Python dependencies
-        shell: bash
-        run: |
-          pip install --upgrade pip
-          pip install nuitka zstandard
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-
-      - name: Build with Nuitka
-        shell: bash
-        run: |
-          DATA_FILES=""
-          if [ -f white_files.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
-          fi
-          if [ -f config.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
-          fi
-          
-          OUTPUT_NAME="${{ github.event.repository.name }}-linux-py${{ matrix.python-version }}"
-          
-          nuitka --standalone --onefile \
-            --assume-yes-for-downloads \
-            --enable-plugin=tk-inter \
-            --output-dir=dist \
-            --output-filename="$OUTPUT_NAME.bin" \
-            $DATA_FILES \
-            ${{ needs.prepare.outputs.main_script }}
-
-      - name: Collect build artifacts
-        shell: bash
-        run: |
-          mkdir -p release-artifacts
-          cp dist/*.bin release-artifacts/ 2>/dev/null || true
-          
-          DIST_DIR="dist/${{ github.event.repository.name }}-linux-py${{ matrix.python-version }}.dist"
-          if [ -d "$DIST_DIR" ]; then
-            tar -czf "release-artifacts/${{ github.event.repository.name }}-linux-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-py${{ matrix.python-version }}
-          path: release-artifacts/*
-          if-no-files-found: error
-
-  # =========================================================================
-  # Linux 旧版兼容构建
-  # 通过 needs.prepare.outputs.enable_linux_old 动态控制
-  # =========================================================================
-  build-linux-old:
-    needs: prepare
-    if: |
-      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_linux_old == 'true') || 
-      (github.event_name == 'workflow_dispatch' && inputs.platform == 'linux-old')
-    runs-on: ubuntu-18.04
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: linux-old-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: linux-old-py${{ matrix.python-version }}-
-
-      - name: Install system dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk patchelf
-
-      - name: Install Python dependencies
-        shell: bash
-        run: |
-          pip install --upgrade pip
-          pip install nuitka zstandard
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-
-      - name: Build with Nuitka
-        shell: bash
-        run: |
-          DATA_FILES=""
-          if [ -f white_files.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
-          fi
-          if [ -f config.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
-          fi
-          
-          OUTPUT_NAME="${{ github.event.repository.name }}-linux-old-py${{ matrix.python-version }}"
-          
-          nuitka --standalone --onefile \
-            --assume-yes-for-downloads \
-            --enable-plugin=tk-inter \
-            --output-dir=dist \
-            --output-filename="$OUTPUT_NAME.bin" \
-            $DATA_FILES \
-            ${{ needs.prepare.outputs.main_script }}
-
-      - name: Collect build artifacts
-        shell: bash
-        run: |
-          mkdir -p release-artifacts
-          cp dist/*.bin release-artifacts/ 2>/dev/null || true
-          
-          DIST_DIR="dist/${{ github.event.repository.name }}-linux-old-py${{ matrix.python-version }}.dist"
-          if [ -d "$DIST_DIR" ]; then
-            tar -czf "release-artifacts/${{ github.event.repository.name }}-linux-old-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-old-py${{ matrix.python-version }}
-          path: release-artifacts/*
-          if-no-files-found: error
-
-  # =========================================================================
-  # macOS构建
-  # 通过 needs.prepare.outputs.enable_macos 动态控制
-  # =========================================================================
-  build-macos:
-    needs: prepare
-    if: |
-      (github.event_name != 'workflow_dispatch' && needs.prepare.outputs.enable_macos == 'true') || 
-      (github.event_name == 'workflow_dispatch' && (
-        inputs.platform == 'all' || 
-        inputs.platform == 'macos'
-      ))
-    runs-on: macos-latest
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ${{ fromJson(needs.prepare.outputs.python_matrix) }}
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/pip
-          key: macos-py${{ matrix.python-version }}-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: macos-py${{ matrix.python-version }}-
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          pip install --upgrade pip
-          pip install nuitka zstandard
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-
-      - name: Build with Nuitka
-        shell: bash
-        run: |
-          DATA_FILES=""
-          if [ -f white_files.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=white_files.json=white_files.json"
-          fi
-          if [ -f config.json ]; then
-            DATA_FILES="$DATA_FILES --include-data-file=config.json=config.json"
-          fi
-          
-          OUTPUT_NAME="${{ github.event.repository.name }}-macos-py${{ matrix.python-version }}"
-          
-          nuitka --standalone --onefile \
-            --assume-yes-for-downloads \
-            --enable-plugin=tk-inter \
-            --macos-disable-console \
-            --output-dir=dist \
-            --output-filename="$OUTPUT_NAME" \
-            $DATA_FILES \
-            ${{ needs.prepare.outputs.main_script }}
-
-      - name: Collect build artifacts
-        shell: bash
-        run: |
-          mkdir -p release-artifacts
-          cp dist/${{ github.event.repository.name }}-macos-py${{ matrix.python-version }} release-artifacts/ 2>/dev/null || true
-          
-          DIST_DIR="dist/${{ github.event.repository.name }}-macos-py${{ matrix.python-version }}.app"
-          if [ -d "$DIST_DIR" ]; then
-            tar -czf "release-artifacts/${{ github.event.repository.name }}-macos-py${{ matrix.python-version }}-full.tar.gz" -C "$DIST_DIR" .
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-py${{ matrix.python-version }}
+          name: ${{ matrix.build.id }}-py${{ matrix.python-version }}
           path: release-artifacts/*
           if-no-files-found: error
 
@@ -647,19 +448,16 @@ jobs:
   # Release发布阶段
   # =========================================================================
   release:
-    needs: [prepare, build-win64, build-win32, build-linux, build-linux-old, build-macos]
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # 只有当需要发布且构建成功时才执行
     if: |
       always() && 
       needs.prepare.result == 'success' && 
       needs.prepare.outputs.should_release == 'true' &&
-      (needs.build-win64.result == 'success' || 
-       needs.build-win32.result == 'success' || 
-       needs.build-linux.result == 'success' ||
-       needs.build-linux-old.result == 'success' ||
-       needs.build-macos.result == 'success')
+      needs.build.result == 'success'
     
     steps:
       - name: Download all build artifacts
@@ -673,7 +471,7 @@ jobs:
         shell: bash
         run: |
           echo "=== 构建产物结构 ==="
-          find all-artifacts -type f | head -20
+          find all-artifacts -type f | head -30
           
           echo ""
           echo "=== 各平台产物统计 ==="
@@ -699,8 +497,9 @@ jobs:
               for file in "$artifact_dir"/*; do
                 if [ -f "$file" ]; then
                   filename=$(basename "$file")
-                  cp "$file" "release-assets/${platform}-${filename}"
-                  echo "  -> ${platform}-${filename}"
+                  # 保持文件名简洁，去掉重复的平台标识
+                  cp "$file" "release-assets/${filename}"
+                  echo "  -> ${filename}"
                 fi
               done
             fi
@@ -717,20 +516,20 @@ jobs:
           name: Release ${{ needs.prepare.outputs.version }}
           body: |
             ## 构建配置
-            ${{ needs.prepare.outputs.build_config }}
+            ${{ needs.prepare.outputs.build_summary }}
             
             ## 文件说明
-            - `*-win64-pyX.Y.exe`: Windows 64位单文件版本 (Python X.Y)
-            - `*-win32-pyX.Y.exe`: Windows 32位单文件版本 (Python X.Y)
-            - `*-linux-pyX.Y.bin`: Linux x86_64单文件版本 (Python X.Y)
-            - `*-linux-old-pyX.Y.bin`: Linux 旧版兼容单文件版本 (Python X.Y)
-            - `*-macos-pyX.Y`: macOS单文件版本 (Python X.Y)
-            - `*-full.zip`: Windows完整多文件版本（解压后运行）
-            - `*-full.tar.gz`: Linux/macOS完整多文件版本（解压后运行）
+            - `*-win64-pyX.Y.exe`: Windows 64位单文件版本
+            - `*-win32-pyX.Y.exe`: Windows 32位单文件版本  
+            - `*-linux-pyX.Y.bin`: Linux x86_64单文件版本
+            - `*-linux-old-pyX.Y.bin`: Linux 旧版兼容单文件版本
+            - `*-macos-pyX.Y`: macOS单文件版本
+            - `*-full.zip`: Windows完整多文件版本
+            - `*-full.tar.gz`: Linux/macOS完整多文件版本
             
             ## 使用说明
-            - **单文件版本**: 直接运行上述 `.exe`、`.bin` 或无名扩展文件
-            - **完整版本**: 解压 `-full` 压缩包，运行其中的主程序
+            - **单文件版本**: 直接运行上述文件
+            - **完整版本**: 解压 `-full` 压缩包后运行
           generate_release_notes: true
           files: release-assets/*
           fail_on_unmatched_files: false
