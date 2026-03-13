@@ -1,0 +1,110 @@
+name: Build onnxruntime for ARMv7l (Cross-Compile)
+
+on:
+  workflow_dispatch: # 允许手动触发
+  push:
+    paths:
+      - '.github/workflows/build-onnxruntime-armv7.yml'
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: arm/v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build onnxruntime Wheel
+        run: |
+          # 创建用于构建的 Dockerfile
+          cat <<EOF > Dockerfile.build
+          # 使用支持 armv7 的构建镜像
+          FROM balenalib/raspberrypi3-python:3.10-bullseye-build
+
+          ARG ONNXRUNTIME_VERSION=1.16.3
+          ARG PYTHON_VERSION=3.10
+
+          # 启动交叉编译环境
+          RUN [ "cross-build-start" ]
+
+          # 1. 安装系统级依赖
+          RUN apt-get update && apt-get install -y \
+              build-essential \
+              cmake \
+              git \
+              wget \
+              libssl-dev \
+              libffi-dev \
+              python${PYTHON_VERSION} \
+              python${PYTHON_VERSION}-dev \
+              python${PYTHON_VERSION}-pip \
+              libopenblas-dev \
+              libeigen3-dev \
+              zip \
+              zlib1g-dev \
+              && rm -rf /var/lib/apt/lists/*
+
+          # 2. 安装 Python 构建依赖
+          RUN python${PYTHON_VERSION} -m pip install --upgrade pip setuptools wheel numpy cython packaging sympy
+
+          # 3. 克隆 onnxruntime 源码 (浅克隆以节省时间)
+          WORKDIR /source
+          RUN git clone --depth 1 --branch v${ONNXRUNTIME_VERSION} --recursive https://github.com/microsoft/onnxruntime.git
+
+          WORKDIR /source/onnxruntime
+
+          # 4. 执行编译
+          # --use_openblas: 使用 OpenBLAS 加速 (ARMv7 必备)
+          # --arm_version 7: 指定 ARMv7 架构
+          # --skip_tests: 跳过测试以节省时间
+          # --parallel: 启用并行编译 (注意内存压力)
+          RUN python${PYTHON_VERSION} build.sh \
+              --config Release \
+              --update \
+              --build \
+              --build_wheel \
+              --use_openblas \
+              --arm_version 7 \
+              --skip_tests \
+              --enable_pybind \
+              --parallel $(nproc)
+
+          # 5. 提取生成的 .whl 文件
+          WORKDIR /source/onnxruntime/build/Linux/Release/dist
+          RUN ls -lh *.whl
+          RUN mkdir -p /output && cp *.whl /output/
+
+          # 结束交叉编译
+          RUN [ "cross-build-end" ]
+          EOF
+
+          # 创建输出目录
+          mkdir -p output
+
+          # 执行 Docker 构建 (使用 buildx 进行跨平台构建)
+          # --load 将镜像加载到本地以便提取文件
+          docker buildx build --platform linux/arm/v7 -t onnxruntime-builder --load .
+
+          # 从构建好的镜像中提取 .whl 文件
+          CONTAINER_ID=$(docker create onnxruntime-builder)
+          docker cp $CONTAINER_ID:/output/. ./output/
+          docker rm $CONTAINER_ID
+
+          # 显示生成的文件
+          echo "Build completed. Files:"
+          ls -lh output/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: onnxruntime-armv7l-wheels
+          path: output/*.whl
+          retention-days: 7
